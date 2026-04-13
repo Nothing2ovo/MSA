@@ -8,14 +8,17 @@ DEFAULT_MOE_BALANCE_WEIGHT = 1e-2
 DEFAULT_RENYI_ALPHA = 1.9
 DEFAULT_RENYI_RANK = 10
 DEFAULT_TOKEN_REG_WEIGHT = 2e-2
-DEFAULT_HYPERGRAPH_REG_WEIGHT = 3e-2
+DEFAULT_HYPERGRAPH_REG_WEIGHT = 8e-2
 DEFAULT_TOKEN_TARGET_ENTROPY = 0.80
 DEFAULT_PRIVATE_MIN_WEIGHT = 0.08
 DEFAULT_SHARED_TARGET_WEIGHT = 0.34
 DEFAULT_SHARED_DOMINANCE_MARGIN = 0.02
 DEFAULT_TOKEN_MAX_WEIGHT = 0.70
-DEFAULT_EDGE_TARGET_STD = 0.08
-DEFAULT_EDGE_MIN_GAP = 0.03
+DEFAULT_EDGE_TARGET_STD = 0.03
+DEFAULT_EDGE_MIN_GAP = 0.02
+DEFAULT_CROSS_EDGE_TARGET_STD = 0.015
+DEFAULT_INTRA_EDGE_TARGET_STD = 0.015
+DEFAULT_EDGE_SPREAD_MARGIN = 0.05
 
 
 def compute_mae(preds: torch.Tensor, labels: torch.Tensor) -> float:
@@ -143,14 +146,20 @@ def moe_load_loss(aux: Dict[str, torch.Tensor], balance_weight: float = DEFAULT_
     return sum(losses) / len(losses)
 
 
+
 def hypergraph_structure_loss(
     aux: Dict[str, torch.Tensor],
     target_edge_std: float = DEFAULT_EDGE_TARGET_STD,
     min_cross_intra_gap: float = DEFAULT_EDGE_MIN_GAP,
+    target_cross_std: float = DEFAULT_CROSS_EDGE_TARGET_STD,
+    target_intra_std: float = DEFAULT_INTRA_EDGE_TARGET_STD,
+    min_edge_spread: float = DEFAULT_EDGE_SPREAD_MARGIN,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    为了与论文总体目标对齐，这里不再把额外的超图结构正则加入优化；
-    仅保留统计量，方便日志观察超图边权分布。
+    防塌缩超图正则：
+    1) 整体边权方差不能太小；
+    2) cross / intra 两类边不能完全重合；
+    3) 强边与弱边之间要有可见间隔。
     """
     hyper_aux = aux["hyper_aux"]
     last_edge_w = hyper_aux["edge_weights_per_layer"][-1]
@@ -163,13 +172,28 @@ def hypergraph_structure_loss(
     intra_std = intra_w.std(unbiased=False) if intra_w.numel() > 1 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
     gap = torch.abs(cross_w.mean() - intra_w.mean()) if cross_w.numel() > 0 and intra_w.numel() > 0 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
 
-    loss = torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
+    if last_edge_w.numel() >= 4:
+        k = max(1, last_edge_w.numel() // 10)
+        top_mean = torch.topk(last_edge_w, k=k).values.mean()
+        bottom_mean = torch.topk(last_edge_w, k=k, largest=False).values.mean()
+        spread = top_mean - bottom_mean
+    else:
+        spread = torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
+
+    loss = (
+        F.relu(target_edge_std - edge_std)
+        + 0.5 * F.relu(target_cross_std - cross_std)
+        + 0.5 * F.relu(target_intra_std - intra_std)
+        + 1.0 * F.relu(min_cross_intra_gap - gap)
+        + 1.0 * F.relu(min_edge_spread - spread)
+    )
     stats = {
         "hypergraph_reg_loss": float(loss.item()),
         "edge_weight_std": float(edge_std.item()),
         "cross_edge_weight_std": float(cross_std.item()),
         "intra_edge_weight_std": float(intra_std.item()),
         "cross_intra_gap": float(gap.item()),
+        "edge_spread": float(spread.item()),
     }
     return loss, stats
 
@@ -383,7 +407,7 @@ def total_loss(
     l_token_reg, token_stats = token_regularization_loss(token_weights)
     l_hg, hg_stats = hypergraph_structure_loss(aux)
 
-    total = l_task + alpha * l_s + beta * l_r + gamma * l_m + delta * l_mmib + token_reg_weight * l_token_reg
+    total = l_task + alpha * l_s + beta * l_r + gamma * l_m + delta * l_mmib + token_reg_weight * l_token_reg + hypergraph_reg_weight * l_hg
 
     transformer_attn = aux["tgib_aux"]["transformer_attn"]
     if transformer_attn.dim() == 4:
@@ -409,6 +433,7 @@ def total_loss(
         "intra_edge_weight_std": float(hyper_aux["intra_edge_weight_std"].item()),
         "edge_weight_std": hg_stats["edge_weight_std"],
         "cross_intra_gap": hg_stats["cross_intra_gap"],
+        "edge_spread": hg_stats["edge_spread"],
         "node_attn_t": float(hyper_aux["node_attn"][:, 0].mean().item()),
         "node_attn_v": float(hyper_aux["node_attn"][:, 1].mean().item()),
         "node_attn_a": float(hyper_aux["node_attn"][:, 2].mean().item()),
@@ -473,6 +498,7 @@ def evaluate(
         "intra_edge_weight_std": 0.0,
         "edge_weight_std": 0.0,
         "cross_intra_gap": 0.0,
+        "edge_spread": 0.0,
         "node_attn_t": 0.0,
         "node_attn_v": 0.0,
         "node_attn_a": 0.0,

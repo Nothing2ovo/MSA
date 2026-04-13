@@ -97,6 +97,8 @@ def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) ->
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, history["cross_edge_weight_mean"], label="cross edge weight")
     plt.plot(epochs, history["intra_edge_weight_mean"], label="intra edge weight")
+    plt.plot(epochs, history["edge_weight_std"], label="edge std")
+    plt.plot(epochs, history["cross_intra_gap"], label="cross/intra gap")
     plt.plot(epochs, history["token_weight_shared"], label="token weight shared")
     plt.plot(epochs, history["token_weight_text"], label="token weight text")
     plt.plot(epochs, history["token_weight_vision"], label="token weight vision")
@@ -141,7 +143,7 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
         f"  intra edge mean     : {analysis['intra_edge_weight_mean']:.4f}",
         f"  node attn t/v/a     : {analysis['node_attn_t']:.4f} / {analysis['node_attn_v']:.4f} / {analysis['node_attn_a']:.4f}",
         f"  token w s/t/v/a     : {analysis['token_weight_shared']:.4f} / {analysis['token_weight_text']:.4f} / {analysis['token_weight_vision']:.4f} / {analysis['token_weight_audio']:.4f}",
-        f"  edge std / gap      : {analysis['edge_weight_std']:.4f} / {analysis['cross_intra_gap']:.4f}",
+        f"  edge std/gap/spread : {analysis['edge_weight_std']:.4f} / {analysis['cross_intra_gap']:.4f} / {analysis['edge_spread']:.4f}",
         f"  dominance margin    : {analysis['token_dominance_margin']:.4f}",
         f"  attn s->s/t/v/a     : {analysis['attn_shared_to_shared']:.4f} / {analysis['attn_shared_to_text']:.4f} / {analysis['attn_shared_to_vision']:.4f} / {analysis['attn_shared_to_audio']:.4f}",
         f"  gate t/v/a          : {analysis['gate_t_mean']:.4f} / {analysis['gate_v_mean']:.4f} / {analysis['gate_a_mean']:.4f}",
@@ -196,7 +198,7 @@ def print_epoch_summary(
     )
     print(
         f"  structure       = cross/intra {valid_metrics['analysis']['cross_edge_weight_mean']:.4f} / {valid_metrics['analysis']['intra_edge_weight_mean']:.4f} | "
-        f"edge_std {valid_metrics['analysis']['edge_weight_std']:.4f} | gap {valid_metrics['analysis']['cross_intra_gap']:.4f} | "
+        f"edge_std {valid_metrics['analysis']['edge_weight_std']:.4f} | gap {valid_metrics['analysis']['cross_intra_gap']:.4f} | spread {valid_metrics['analysis']['edge_spread']:.4f} | "
         f"token s/t/v/a {valid_metrics['analysis']['token_weight_shared']:.4f} / {valid_metrics['analysis']['token_weight_text']:.4f} / {valid_metrics['analysis']['token_weight_vision']:.4f} / {valid_metrics['analysis']['token_weight_audio']:.4f}"
     )
     print(f"  selection score = {score:.4f}")
@@ -230,7 +232,7 @@ def main() -> None:
     mmib_mae_weight = 0.5
     mmib_kl_weight = 5e-5
     token_reg_weight = 0.04
-    hypergraph_reg_weight = 0.03
+    hypergraph_reg_weight = 0.08
 
     ib_warmup_epochs = 6
     ib_ramp_epochs = 6
@@ -301,6 +303,8 @@ def main() -> None:
         "token_weight_text": [],
         "token_weight_vision": [],
         "token_weight_audio": [],
+        "edge_weight_std": [],
+        "cross_intra_gap": [],
         "token_entropy": [],
         "token_max_weight": [],
     }
@@ -361,6 +365,8 @@ def main() -> None:
         history["token_weight_text"].append(valid_metrics["analysis"]["token_weight_text"])
         history["token_weight_vision"].append(valid_metrics["analysis"]["token_weight_vision"])
         history["token_weight_audio"].append(valid_metrics["analysis"]["token_weight_audio"])
+        history["edge_weight_std"].append(valid_metrics["analysis"]["edge_weight_std"])
+        history["cross_intra_gap"].append(valid_metrics["analysis"]["cross_intra_gap"])
         history["token_entropy"].append(valid_metrics["token_entropy"])
         history["token_max_weight"].append(valid_metrics["token_max_weight"])
 
@@ -398,6 +404,7 @@ def main() -> None:
         sim_margin=sim_margin, renyi_alpha=renyi_alpha, renyi_rank_k=renyi_rank_k,
         mmib_mae_weight=mmib_mae_weight, mmib_kl_weight=mmib_kl_weight,
         token_reg_weight=token_reg_weight,
+        hypergraph_reg_weight=hypergraph_reg_weight,
     )
     final_test = evaluate(
         model, test_loader, device,
@@ -405,14 +412,15 @@ def main() -> None:
         sim_margin=sim_margin, renyi_alpha=renyi_alpha, renyi_rank_k=renyi_rank_k,
         mmib_mae_weight=mmib_mae_weight, mmib_kl_weight=mmib_kl_weight,
         token_reg_weight=token_reg_weight,
+        hypergraph_reg_weight=hypergraph_reg_weight,
     )
 
     print("\n========== Final Validation ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc7", "total_loss", "mmib_loss", "token_reg_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc7", "total_loss", "mmib_loss", "token_reg_loss", "hypergraph_reg_loss"]:
         print(f"{k:<14}: {final_valid[k]:.4f}")
 
     print("\n========== Final Test ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc7", "total_loss", "mmib_loss", "token_reg_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc7", "total_loss", "mmib_loss", "token_reg_loss", "hypergraph_reg_loss"]:
         print(f"{k:<14}: {final_test[k]:.4f}")
 
     save_final_test_results(RESULTS_FILE, final_test)
