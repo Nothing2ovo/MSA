@@ -566,7 +566,7 @@ def evaluate(
 
         for key in [
             "cross_edge_weight_mean", "intra_edge_weight_mean",
-            "cross_edge_weight_std", "intra_edge_weight_std", "edge_weight_std", "cross_intra_gap",
+            "cross_edge_weight_std", "intra_edge_weight_std", "edge_weight_std", "cross_intra_gap", "edge_spread",
             "node_attn_t", "node_attn_v", "node_attn_a",
             "token_weight_shared", "token_weight_text", "token_weight_vision", "token_weight_audio", "token_dominance_margin",
             "attn_shared_to_shared", "attn_shared_to_text", "attn_shared_to_vision", "attn_shared_to_audio",

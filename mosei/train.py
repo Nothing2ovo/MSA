@@ -99,6 +99,7 @@ def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) ->
     plt.plot(epochs, history["intra_edge_weight_mean"], label="intra edge weight")
     plt.plot(epochs, history["edge_weight_std"], label="edge std")
     plt.plot(epochs, history["cross_intra_gap"], label="cross/intra gap")
+    plt.plot(epochs, history["edge_spread"], label="edge spread")
     plt.plot(epochs, history["token_weight_shared"], label="token weight shared")
     plt.plot(epochs, history["token_weight_text"], label="token weight text")
     plt.plot(epochs, history["token_weight_vision"], label="token weight vision")
@@ -175,7 +176,7 @@ def print_epoch_summary(
         f"  train total/task= {train_stats['train_total_loss']:.4f} / {train_stats['train_task_loss']:.4f} | "
         f"sim={train_stats['train_sim_loss']:.4f} recon={train_stats['train_recon_loss']:.4f} "
         f"moe={train_stats['train_moe_loss']:.4f} token_reg={train_stats['train_token_reg_loss']:.4f} "
-        f"hyper_reg={train_stats['train_hypergraph_reg_loss']:.4f} tgib={train_stats['train_mmib_loss']:.4f}"
+        f"hyper_reg={train_stats['train_hypergraph_reg_loss']:.6f} tgib={train_stats['train_mmib_loss']:.4f}"
     )
     print(
         f"  valid MAE/Corr  = {valid_metrics['MAE']:.4f} / {valid_metrics['Corr']:.4f} | "
@@ -305,6 +306,7 @@ def main() -> None:
         "token_weight_audio": [],
         "edge_weight_std": [],
         "cross_intra_gap": [],
+        "edge_spread": [],
         "token_entropy": [],
         "token_max_weight": [],
     }
@@ -367,6 +369,7 @@ def main() -> None:
         history["token_weight_audio"].append(valid_metrics["analysis"]["token_weight_audio"])
         history["edge_weight_std"].append(valid_metrics["analysis"]["edge_weight_std"])
         history["cross_intra_gap"].append(valid_metrics["analysis"]["cross_intra_gap"])
+        history["edge_spread"].append(valid_metrics["analysis"]["edge_spread"])
         history["token_entropy"].append(valid_metrics["token_entropy"])
         history["token_max_weight"].append(valid_metrics["token_max_weight"])
 
