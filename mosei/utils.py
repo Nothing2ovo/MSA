@@ -8,17 +8,17 @@ DEFAULT_MOE_BALANCE_WEIGHT = 1e-2
 DEFAULT_RENYI_ALPHA = 1.9
 DEFAULT_RENYI_RANK = 10
 DEFAULT_TOKEN_REG_WEIGHT = 2e-2
-DEFAULT_HYPERGRAPH_REG_WEIGHT = 8e-2
+DEFAULT_HYPERGRAPH_REG_WEIGHT = 4e-2
 DEFAULT_TOKEN_TARGET_ENTROPY = 0.80
 DEFAULT_PRIVATE_MIN_WEIGHT = 0.08
 DEFAULT_SHARED_TARGET_WEIGHT = 0.34
 DEFAULT_SHARED_DOMINANCE_MARGIN = 0.02
 DEFAULT_TOKEN_MAX_WEIGHT = 0.70
-DEFAULT_EDGE_TARGET_STD = 0.035
-DEFAULT_EDGE_MIN_GAP = 0.015
-DEFAULT_CROSS_EDGE_TARGET_STD = 0.018
-DEFAULT_INTRA_EDGE_TARGET_STD = 0.018
-DEFAULT_EDGE_SPREAD_MARGIN = 0.06
+DEFAULT_EDGE_TARGET_STD = 0.028
+DEFAULT_EDGE_MIN_GAP = 0.012
+DEFAULT_CROSS_EDGE_TARGET_STD = 0.014
+DEFAULT_INTRA_EDGE_TARGET_STD = 0.014
+DEFAULT_EDGE_SPREAD_MARGIN = 0.035
 
 
 def compute_mae(preds: torch.Tensor, labels: torch.Tensor) -> float:
@@ -201,8 +201,8 @@ def hypergraph_structure_loss(
 
     num_layers = int(per_layer_edge_std.numel())
     layer_weights = torch.linspace(
-        0.85,
-        1.15,
+        0.95,
+        1.05,
         steps=max(1, num_layers),
         device=per_layer_edge_std.device,
         dtype=per_layer_edge_std.dtype,
@@ -224,20 +224,20 @@ def hypergraph_structure_loss(
         prev_edge_std = per_layer_edge_std[:-1]
         next_spread = per_layer_spread[1:]
         prev_spread = per_layer_spread[:-1]
-        late_std_preserve_pen = F.relu(0.65 * prev_edge_std - next_edge_std).mean()
-        late_spread_preserve_pen = F.relu(0.65 * prev_spread - next_spread).mean()
+        late_std_preserve_pen = F.relu(0.50 * prev_edge_std - next_edge_std).mean()
+        late_spread_preserve_pen = F.relu(0.50 * prev_spread - next_spread).mean()
     else:
         late_std_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
         late_spread_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
 
     loss = (
-        1.40 * edge_std_pen
-        + 0.75 * cross_std_pen
-        + 0.75 * intra_std_pen
-        + 1.30 * spread_pen
-        + 0.30 * gap_pen
-        + 0.25 * late_std_preserve_pen
-        + 0.25 * late_spread_preserve_pen
+        1.00 * edge_std_pen
+        + 0.45 * cross_std_pen
+        + 0.45 * intra_std_pen
+        + 0.85 * spread_pen
+        + 0.20 * gap_pen
+        + 0.10 * late_std_preserve_pen
+        + 0.10 * late_spread_preserve_pen
     )
 
     stats = {
