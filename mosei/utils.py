@@ -14,11 +14,11 @@ DEFAULT_PRIVATE_MIN_WEIGHT = 0.08
 DEFAULT_SHARED_TARGET_WEIGHT = 0.34
 DEFAULT_SHARED_DOMINANCE_MARGIN = 0.02
 DEFAULT_TOKEN_MAX_WEIGHT = 0.70
-DEFAULT_EDGE_TARGET_STD = 0.03
-DEFAULT_EDGE_MIN_GAP = 0.02
-DEFAULT_CROSS_EDGE_TARGET_STD = 0.015
-DEFAULT_INTRA_EDGE_TARGET_STD = 0.015
-DEFAULT_EDGE_SPREAD_MARGIN = 0.05
+DEFAULT_EDGE_TARGET_STD = 0.035
+DEFAULT_EDGE_MIN_GAP = 0.015
+DEFAULT_CROSS_EDGE_TARGET_STD = 0.018
+DEFAULT_INTRA_EDGE_TARGET_STD = 0.018
+DEFAULT_EDGE_SPREAD_MARGIN = 0.06
 
 
 def compute_mae(preds: torch.Tensor, labels: torch.Tensor) -> float:
@@ -156,44 +156,106 @@ def hypergraph_structure_loss(
     min_edge_spread: float = DEFAULT_EDGE_SPREAD_MARGIN,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    防塌缩超图正则：
-    1) 整体边权方差不能太小；
-    2) cross / intra 两类边不能完全重合；
-    3) 强边与弱边之间要有可见间隔。
+    多层防塌缩超图正则：
+    1) 不再只约束最后一层，而是所有 hypergraph layers 一起约束；
+    2) 重点放在 edge std / edge spread，gap 只作为次级约束；
+    3) 增加后层保形约束，减少“前层有差异、后层又抹平”的二次回缩。
     """
     hyper_aux = aux["hyper_aux"]
-    last_edge_w = hyper_aux["edge_weights_per_layer"][-1]
-    num_cross = int(hyper_aux["cross_edges"].item())
-    cross_w = last_edge_w[:num_cross]
-    intra_w = last_edge_w[num_cross:]
 
-    edge_std = last_edge_w.std(unbiased=False) if last_edge_w.numel() > 1 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
-    cross_std = cross_w.std(unbiased=False) if cross_w.numel() > 1 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
-    intra_std = intra_w.std(unbiased=False) if intra_w.numel() > 1 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
-    gap = torch.abs(cross_w.mean() - intra_w.mean()) if cross_w.numel() > 0 and intra_w.numel() > 0 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
-
-    if last_edge_w.numel() >= 4:
-        k = max(1, last_edge_w.numel() // 10)
-        top_mean = torch.topk(last_edge_w, k=k).values.mean()
-        bottom_mean = torch.topk(last_edge_w, k=k, largest=False).values.mean()
-        spread = top_mean - bottom_mean
+    if "per_layer_edge_weight_std" in hyper_aux:
+        per_layer_edge_std = hyper_aux["per_layer_edge_weight_std"]
+        per_layer_cross_std = hyper_aux["per_layer_cross_edge_weight_std"]
+        per_layer_intra_std = hyper_aux["per_layer_intra_edge_weight_std"]
+        per_layer_gap = hyper_aux["per_layer_cross_intra_gap"].abs()
+        per_layer_spread = hyper_aux["per_layer_edge_spread"]
     else:
-        spread = torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
+        num_cross = int(hyper_aux["cross_edges"].item())
+        edge_stds = []
+        cross_stds = []
+        intra_stds = []
+        gaps = []
+        spreads = []
+        zero = None
+        for edge_w in hyper_aux["edge_weights_per_layer"]:
+            if zero is None:
+                zero = torch.zeros((), device=edge_w.device, dtype=edge_w.dtype)
+            cross_w = edge_w[:num_cross]
+            intra_w = edge_w[num_cross:]
+            edge_stds.append(edge_w.std(unbiased=False) if edge_w.numel() > 1 else zero)
+            cross_stds.append(cross_w.std(unbiased=False) if cross_w.numel() > 1 else zero)
+            intra_stds.append(intra_w.std(unbiased=False) if intra_w.numel() > 1 else zero)
+            gaps.append(torch.abs(cross_w.mean() - intra_w.mean()) if cross_w.numel() > 0 and intra_w.numel() > 0 else zero)
+            if edge_w.numel() >= 4:
+                k = max(1, edge_w.numel() // 10)
+                top_mean = torch.topk(edge_w, k=k).values.mean()
+                bottom_mean = torch.topk(edge_w, k=k, largest=False).values.mean()
+                spreads.append(top_mean - bottom_mean)
+            else:
+                spreads.append(zero)
+        per_layer_edge_std = torch.stack(edge_stds)
+        per_layer_cross_std = torch.stack(cross_stds)
+        per_layer_intra_std = torch.stack(intra_stds)
+        per_layer_gap = torch.stack(gaps)
+        per_layer_spread = torch.stack(spreads)
+
+    num_layers = int(per_layer_edge_std.numel())
+    layer_weights = torch.linspace(
+        0.85,
+        1.15,
+        steps=max(1, num_layers),
+        device=per_layer_edge_std.device,
+        dtype=per_layer_edge_std.dtype,
+    )
+    layer_weights = layer_weights / layer_weights.sum().clamp_min(1e-8)
+
+    def weighted_mean(x: torch.Tensor) -> torch.Tensor:
+        return torch.sum(layer_weights * x)
+
+    edge_std_pen = weighted_mean(F.relu(target_edge_std - per_layer_edge_std))
+    cross_std_pen = weighted_mean(F.relu(target_cross_std - per_layer_cross_std))
+    intra_std_pen = weighted_mean(F.relu(target_intra_std - per_layer_intra_std))
+    gap_pen = weighted_mean(F.relu(min_cross_intra_gap - per_layer_gap))
+    spread_pen = weighted_mean(F.relu(min_edge_spread - per_layer_spread))
+
+    if num_layers > 1:
+        # 后层不要比前层塌得太快；允许下降，但不允许急剧回缩
+        next_edge_std = per_layer_edge_std[1:]
+        prev_edge_std = per_layer_edge_std[:-1]
+        next_spread = per_layer_spread[1:]
+        prev_spread = per_layer_spread[:-1]
+        late_std_preserve_pen = F.relu(0.65 * prev_edge_std - next_edge_std).mean()
+        late_spread_preserve_pen = F.relu(0.65 * prev_spread - next_spread).mean()
+    else:
+        late_std_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
+        late_spread_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
 
     loss = (
-        F.relu(target_edge_std - edge_std)
-        + 0.5 * F.relu(target_cross_std - cross_std)
-        + 0.5 * F.relu(target_intra_std - intra_std)
-        + 1.0 * F.relu(min_cross_intra_gap - gap)
-        + 1.0 * F.relu(min_edge_spread - spread)
+        1.40 * edge_std_pen
+        + 0.75 * cross_std_pen
+        + 0.75 * intra_std_pen
+        + 1.30 * spread_pen
+        + 0.30 * gap_pen
+        + 0.25 * late_std_preserve_pen
+        + 0.25 * late_spread_preserve_pen
     )
+
     stats = {
         "hypergraph_reg_loss": float(loss.item()),
-        "edge_weight_std": float(edge_std.item()),
-        "cross_edge_weight_std": float(cross_std.item()),
-        "intra_edge_weight_std": float(intra_std.item()),
-        "cross_intra_gap": float(gap.item()),
-        "edge_spread": float(spread.item()),
+        # backward-compatible keys use multi-layer means now
+        "edge_weight_std": float(per_layer_edge_std.mean().item()),
+        "cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
+        "intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
+        "cross_intra_gap": float(per_layer_gap.mean().item()),
+        "edge_spread": float(per_layer_spread.mean().item()),
+        # extra diagnostics
+        "multi_layer_edge_weight_std": float(per_layer_edge_std.mean().item()),
+        "multi_layer_cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
+        "multi_layer_intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
+        "multi_layer_cross_intra_gap": float(per_layer_gap.mean().item()),
+        "multi_layer_edge_spread": float(per_layer_spread.mean().item()),
+        "late_std_preserve_penalty": float(late_std_preserve_pen.item()),
+        "late_spread_preserve_penalty": float(late_spread_preserve_pen.item()),
     }
     return loss, stats
 
@@ -434,6 +496,11 @@ def total_loss(
         "edge_weight_std": hg_stats["edge_weight_std"],
         "cross_intra_gap": hg_stats["cross_intra_gap"],
         "edge_spread": hg_stats["edge_spread"],
+        "multi_layer_edge_weight_std": hg_stats["multi_layer_edge_weight_std"],
+        "multi_layer_cross_intra_gap": hg_stats["multi_layer_cross_intra_gap"],
+        "multi_layer_edge_spread": hg_stats["multi_layer_edge_spread"],
+        "late_std_preserve_penalty": hg_stats["late_std_preserve_penalty"],
+        "late_spread_preserve_penalty": hg_stats["late_spread_preserve_penalty"],
         "node_attn_t": float(hyper_aux["node_attn"][:, 0].mean().item()),
         "node_attn_v": float(hyper_aux["node_attn"][:, 1].mean().item()),
         "node_attn_a": float(hyper_aux["node_attn"][:, 2].mean().item()),
@@ -499,6 +566,11 @@ def evaluate(
         "edge_weight_std": 0.0,
         "cross_intra_gap": 0.0,
         "edge_spread": 0.0,
+        "multi_layer_edge_weight_std": 0.0,
+        "multi_layer_cross_intra_gap": 0.0,
+        "multi_layer_edge_spread": 0.0,
+        "late_std_preserve_penalty": 0.0,
+        "late_spread_preserve_penalty": 0.0,
         "node_attn_t": 0.0,
         "node_attn_v": 0.0,
         "node_attn_a": 0.0,
@@ -567,6 +639,8 @@ def evaluate(
         for key in [
             "cross_edge_weight_mean", "intra_edge_weight_mean",
             "cross_edge_weight_std", "intra_edge_weight_std", "edge_weight_std", "cross_intra_gap", "edge_spread",
+            "multi_layer_edge_weight_std", "multi_layer_cross_intra_gap", "multi_layer_edge_spread",
+            "late_std_preserve_penalty", "late_spread_preserve_penalty",
             "node_attn_t", "node_attn_v", "node_attn_a",
             "token_weight_shared", "token_weight_text", "token_weight_vision", "token_weight_audio", "token_dominance_margin",
             "attn_shared_to_shared", "attn_shared_to_text", "attn_shared_to_vision", "attn_shared_to_audio",

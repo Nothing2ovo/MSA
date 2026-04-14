@@ -1,4 +1,3 @@
-
 from typing import Dict, List, Tuple
 
 import torch
@@ -98,7 +97,6 @@ class AntiCollapseHypergraphConv(nn.Module):
         self.max_seq_len = int(max_seq_len)
         self.theta = nn.Linear(input_dim, output_dim)
 
-        # slot-based base logits, but with non-zero / asymmetric initialization
         self.cross_edge_logits = nn.Parameter(torch.empty(self.max_batch_size, self.max_seq_len))
         self.intra_edge_logits = nn.Parameter(torch.empty(3, self.max_batch_size, self.max_seq_len))
         nn.init.normal_(self.cross_edge_logits, mean=0.18, std=0.08)
@@ -149,20 +147,17 @@ class AntiCollapseHypergraphConv(nn.Module):
         batch_size: int,
         seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Ht = H.transpose(0, 1)  # [E, N]
+        Ht = H.transpose(0, 1)
         de = H.sum(dim=0).clamp_min(1.0)
         num_cross = batch_size * seq_len
 
-        # edge representation from current node features (breaks symmetry)
         edge_repr = torch.matmul(Ht, x) / de.unsqueeze(-1)
         cross_repr = edge_repr[:num_cross]
         intra_repr = edge_repr[num_cross:]
 
         cross_base, intra_base = self._slice_base_logits(batch_size, seq_len, x.device, x.dtype)
-        cross_res = self.cross_edge_mlp(cross_repr).squeeze(-1)
-        intra_res = self.intra_edge_mlp(intra_repr).squeeze(-1)
-        cross_res = self._normalize_score(cross_res)
-        intra_res = self._normalize_score(intra_res)
+        cross_res = self._normalize_score(self.cross_edge_mlp(cross_repr).squeeze(-1))
+        intra_res = self._normalize_score(self.intra_edge_mlp(intra_repr).squeeze(-1))
 
         cross_logits = cross_base + self.cross_bias + self.cross_res_scale * cross_res
         intra_logits = intra_base + self.intra_bias + self.intra_res_scale * intra_res
@@ -220,6 +215,34 @@ class HypergraphEncoder(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
+    @staticmethod
+    def _compute_edge_stats(edge_w: torch.Tensor, num_cross: int) -> Dict[str, torch.Tensor]:
+        cross_w = edge_w[:num_cross]
+        intra_w = edge_w[num_cross:]
+        zero = torch.zeros((), device=edge_w.device, dtype=edge_w.dtype)
+        cross_mean = cross_w.mean() if cross_w.numel() > 0 else zero
+        intra_mean = intra_w.mean() if intra_w.numel() > 0 else zero
+        cross_std = cross_w.std(unbiased=False) if cross_w.numel() > 1 else zero
+        intra_std = intra_w.std(unbiased=False) if intra_w.numel() > 1 else zero
+        edge_std = edge_w.std(unbiased=False) if edge_w.numel() > 1 else zero
+        cross_intra_gap = cross_mean - intra_mean
+        if edge_w.numel() >= 4:
+            k = max(1, edge_w.numel() // 10)
+            top_mean = torch.topk(edge_w, k=k).values.mean()
+            bottom_mean = torch.topk(edge_w, k=k, largest=False).values.mean()
+            edge_spread = top_mean - bottom_mean
+        else:
+            edge_spread = zero
+        return {
+            'cross_edge_weight_mean': cross_mean,
+            'intra_edge_weight_mean': intra_mean,
+            'cross_edge_weight_std': cross_std,
+            'intra_edge_weight_std': intra_std,
+            'edge_weight_std': edge_std,
+            'cross_intra_gap': cross_intra_gap,
+            'edge_spread': edge_spread,
+        }
+
     def forward(self, shared_seq: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size, _, seq_len, _ = shared_seq.shape
         H, graph_meta = self.builder(shared_seq)
@@ -227,10 +250,27 @@ class HypergraphEncoder(nn.Module):
 
         edge_weights_per_layer: List[torch.Tensor] = []
         edge_repr_per_layer: List[torch.Tensor] = []
+        layer_cross_means: List[torch.Tensor] = []
+        layer_intra_means: List[torch.Tensor] = []
+        layer_cross_stds: List[torch.Tensor] = []
+        layer_intra_stds: List[torch.Tensor] = []
+        layer_edge_stds: List[torch.Tensor] = []
+        layer_gaps: List[torch.Tensor] = []
+        layer_spreads: List[torch.Tensor] = []
+
+        num_cross = batch_size * seq_len
         for layer in self.layers:
             x, edge_w, edge_repr = layer(x, H, batch_size=batch_size, seq_len=seq_len)
             edge_weights_per_layer.append(edge_w)
             edge_repr_per_layer.append(edge_repr)
+            stats = self._compute_edge_stats(edge_w, num_cross)
+            layer_cross_means.append(stats['cross_edge_weight_mean'])
+            layer_intra_means.append(stats['intra_edge_weight_mean'])
+            layer_cross_stds.append(stats['cross_edge_weight_std'])
+            layer_intra_stds.append(stats['intra_edge_weight_std'])
+            layer_edge_stds.append(stats['edge_weight_std'])
+            layer_gaps.append(stats['cross_intra_gap'])
+            layer_spreads.append(stats['edge_spread'])
 
         node_out = x.view(batch_size, 3, seq_len, -1)
         modality_repr = node_out.mean(dim=2)
@@ -239,23 +279,13 @@ class HypergraphEncoder(nn.Module):
         graph_repr = torch.sum(node_attn.unsqueeze(-1) * modality_repr, dim=1)
         graph_repr = self.dropout(graph_repr)
 
-        last_edge_w = edge_weights_per_layer[-1]
-        num_cross = batch_size * seq_len
-        cross_w = last_edge_w[:num_cross]
-        intra_w = last_edge_w[num_cross:]
-        cross_mean = cross_w.mean()
-        intra_mean = intra_w.mean()
-        cross_std = cross_w.std(unbiased=False) if cross_w.numel() > 1 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
-        intra_std = intra_w.std(unbiased=False) if intra_w.numel() > 1 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
-        edge_std = last_edge_w.std(unbiased=False) if last_edge_w.numel() > 1 else torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
-        cross_intra_gap = cross_mean - intra_mean
-        if last_edge_w.numel() >= 4:
-            k = max(1, last_edge_w.numel() // 10)
-            top_mean = torch.topk(last_edge_w, k=k).values.mean()
-            bottom_mean = torch.topk(last_edge_w, k=k, largest=False).values.mean()
-            edge_spread = top_mean - bottom_mean
-        else:
-            edge_spread = torch.zeros((), device=last_edge_w.device, dtype=last_edge_w.dtype)
+        per_layer_cross_means = torch.stack(layer_cross_means)
+        per_layer_intra_means = torch.stack(layer_intra_means)
+        per_layer_cross_stds = torch.stack(layer_cross_stds)
+        per_layer_intra_stds = torch.stack(layer_intra_stds)
+        per_layer_edge_stds = torch.stack(layer_edge_stds)
+        per_layer_gaps = torch.stack(layer_gaps)
+        per_layer_spreads = torch.stack(layer_spreads)
 
         aux = {
             'incidence_matrix': H,
@@ -265,13 +295,26 @@ class HypergraphEncoder(nn.Module):
             'node_attn': node_attn,
             'edge_weights_per_layer': edge_weights_per_layer,
             'edge_repr_per_layer': edge_repr_per_layer,
-            'cross_edge_weight_mean': cross_mean,
-            'intra_edge_weight_mean': intra_mean,
-            'cross_edge_weight_std': cross_std,
-            'intra_edge_weight_std': intra_std,
-            'edge_weight_std': edge_std,
-            'cross_intra_gap': cross_intra_gap,
-            'edge_spread': edge_spread,
+            'per_layer_cross_edge_weight_mean': per_layer_cross_means,
+            'per_layer_intra_edge_weight_mean': per_layer_intra_means,
+            'per_layer_cross_edge_weight_std': per_layer_cross_stds,
+            'per_layer_intra_edge_weight_std': per_layer_intra_stds,
+            'per_layer_edge_weight_std': per_layer_edge_stds,
+            'per_layer_cross_intra_gap': per_layer_gaps,
+            'per_layer_edge_spread': per_layer_spreads,
+            # keep existing keys as last-layer values for backward-compatible logging
+            'cross_edge_weight_mean': per_layer_cross_means[-1],
+            'intra_edge_weight_mean': per_layer_intra_means[-1],
+            'cross_edge_weight_std': per_layer_cross_stds[-1],
+            'intra_edge_weight_std': per_layer_intra_stds[-1],
+            'edge_weight_std': per_layer_edge_stds[-1],
+            'cross_intra_gap': per_layer_gaps[-1],
+            'edge_spread': per_layer_spreads[-1],
+            'multi_layer_cross_edge_weight_mean': per_layer_cross_means.mean(),
+            'multi_layer_intra_edge_weight_mean': per_layer_intra_means.mean(),
+            'multi_layer_edge_weight_std': per_layer_edge_stds.mean(),
+            'multi_layer_cross_intra_gap': per_layer_gaps.mean(),
+            'multi_layer_edge_spread': per_layer_spreads.mean(),
             **graph_meta,
         }
         return graph_repr, aux
