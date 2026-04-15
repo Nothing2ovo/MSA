@@ -119,7 +119,7 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
     analysis = metrics["analysis"]
     lines = [
         f"[{timestamp}]",
-        "========== Final Test (mosei dhm + 4-token tgib moderate) ==========",
+        "========== Final Test (mosei dhm + balanced hg / relaxed 4-token / mild tgib+) ==========",
         f"Test total loss: {metrics['total_loss']:.4f}",
         f"Test task loss : {metrics['task_loss']:.4f}",
         f"Test sim loss  : {metrics['sim_loss']:.4f}",
@@ -224,15 +224,15 @@ def main() -> None:
     alpha = 0.05
     beta = 0.05
     gamma = 0.10
-    delta = 0.0065
+    delta = 0.0080
     sim_margin = 0.20
 
     renyi_alpha = 1.9
     renyi_rank_k = 10
     mmib_mae_weight = 0.5
-    mmib_kl_weight = 5e-5
+    mmib_kl_weight = 7.5e-5
     token_reg_weight = 0.04
-    hypergraph_reg_weight = 0.04
+    hypergraph_reg_weight = 0.055
 
     ib_warmup_epochs = 6
     ib_ramp_epochs = 8
@@ -248,6 +248,9 @@ def main() -> None:
     num_heads = 4
     hg_layers = 3
     intra_k = 3
+
+    print("[Config] stronger-hypergraph / slightly-relaxed-4token / mildly-raised-TGIB")
+    print(f"[Config] delta={delta:.4f} | mmib_kl={mmib_kl_weight:.6f} | hyper_reg_w={hypergraph_reg_weight:.4f}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"seed: {seed} | deterministic: {deterministic}")

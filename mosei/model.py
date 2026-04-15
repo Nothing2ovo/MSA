@@ -146,13 +146,13 @@ class TokenLevelDynamicWeighting(nn.Module):
         private_dim: int,
         token_dim: int = 128,
         dropout: float = 0.1,
-        temperature: float = 1.05,
+        temperature: float = 1.08,
         flatten_power: float = 0.95,
-        prior_mix: float = 0.35,
-        shared_min_weight: float = 0.28,
-        private_min_weight: float = 0.10,
-        gate_scale: float = 0.55,
-        shared_to_private_scale: float = 0.12,
+        prior_mix: float = 0.25,
+        shared_min_weight: float = 0.24,
+        private_min_weight: float = 0.09,
+        gate_scale: float = 0.60,
+        shared_to_private_scale: float = 0.10,
     ):
         super().__init__()
         self.temperature = max(1e-3, float(temperature))
@@ -203,8 +203,8 @@ class TokenLevelDynamicWeighting(nn.Module):
             nn.Linear(token_dim, 1),
         )
         self.shared_affinity_proj = nn.Linear(token_dim, token_dim)
-        self.base_prior_logits = nn.Parameter(torch.tensor([1.10, 0.0, 0.0, 0.0], dtype=torch.float32))
-        self.token_bias = nn.Parameter(torch.tensor([0.35, 0.0, 0.0, 0.0], dtype=torch.float32))
+        self.base_prior_logits = nn.Parameter(torch.tensor([0.90, 0.0, 0.0, 0.0], dtype=torch.float32))
+        self.token_bias = nn.Parameter(torch.tensor([0.22, 0.0, 0.0, 0.0], dtype=torch.float32))
         self.out_norm = nn.LayerNorm(token_dim)
 
     def forward(
@@ -280,7 +280,7 @@ class TokenLevelDynamicWeighting(nn.Module):
         guided_tokens[:, 1:, :] = guided_tokens[:, 1:, :] + self.shared_to_private_scale * shared_anchor.unsqueeze(1)
 
         token_scale = 1.0 + self.gate_scale * (token_weights - prior_dist)
-        token_scale = token_scale.clamp(min=0.85, max=1.30)
+        token_scale = token_scale.clamp(min=0.82, max=1.35)
         weighted_tokens = self.out_norm(guided_tokens * token_scale.unsqueeze(-1))
 
         dominance_margin = token_weights[:, 0] - token_weights[:, 1:].max(dim=1).values
@@ -467,13 +467,13 @@ class DHMModel(nn.Module):
             private_dim=private_dim,
             token_dim=fusion_dim,
             dropout=dropout,
-            temperature=1.05,
+            temperature=1.08,
             flatten_power=0.95,
-            prior_mix=0.35,
-            shared_min_weight=0.28,
-            private_min_weight=0.10,
-            gate_scale=0.55,
-            shared_to_private_scale=0.12,
+            prior_mix=0.25,
+            shared_min_weight=0.24,
+            private_min_weight=0.09,
+            gate_scale=0.60,
+            shared_to_private_scale=0.10,
         )
         self.tgib = TransformerGuidedIB(
             token_dim=fusion_dim,

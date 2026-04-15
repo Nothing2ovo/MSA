@@ -8,17 +8,17 @@ DEFAULT_MOE_BALANCE_WEIGHT = 1e-2
 DEFAULT_RENYI_ALPHA = 1.9
 DEFAULT_RENYI_RANK = 10
 DEFAULT_TOKEN_REG_WEIGHT = 2e-2
-DEFAULT_HYPERGRAPH_REG_WEIGHT = 4e-2
-DEFAULT_TOKEN_TARGET_ENTROPY = 0.80
-DEFAULT_PRIVATE_MIN_WEIGHT = 0.08
-DEFAULT_SHARED_TARGET_WEIGHT = 0.34
-DEFAULT_SHARED_DOMINANCE_MARGIN = 0.02
-DEFAULT_TOKEN_MAX_WEIGHT = 0.70
-DEFAULT_EDGE_TARGET_STD = 0.028
-DEFAULT_EDGE_MIN_GAP = 0.012
-DEFAULT_CROSS_EDGE_TARGET_STD = 0.014
-DEFAULT_INTRA_EDGE_TARGET_STD = 0.014
-DEFAULT_EDGE_SPREAD_MARGIN = 0.035
+DEFAULT_HYPERGRAPH_REG_WEIGHT = 5.5e-2
+DEFAULT_TOKEN_TARGET_ENTROPY = 0.83
+DEFAULT_PRIVATE_MIN_WEIGHT = 0.075
+DEFAULT_SHARED_TARGET_WEIGHT = 0.31
+DEFAULT_SHARED_DOMINANCE_MARGIN = 0.015
+DEFAULT_TOKEN_MAX_WEIGHT = 0.72
+DEFAULT_EDGE_TARGET_STD = 0.034
+DEFAULT_EDGE_MIN_GAP = 0.013
+DEFAULT_CROSS_EDGE_TARGET_STD = 0.018
+DEFAULT_INTRA_EDGE_TARGET_STD = 0.018
+DEFAULT_EDGE_SPREAD_MARGIN = 0.050
 
 
 def compute_mae(preds: torch.Tensor, labels: torch.Tensor) -> float:
@@ -201,8 +201,8 @@ def hypergraph_structure_loss(
 
     num_layers = int(per_layer_edge_std.numel())
     layer_weights = torch.linspace(
-        0.95,
-        1.05,
+        0.90,
+        1.10,
         steps=max(1, num_layers),
         device=per_layer_edge_std.device,
         dtype=per_layer_edge_std.dtype,
@@ -224,20 +224,20 @@ def hypergraph_structure_loss(
         prev_edge_std = per_layer_edge_std[:-1]
         next_spread = per_layer_spread[1:]
         prev_spread = per_layer_spread[:-1]
-        late_std_preserve_pen = F.relu(0.50 * prev_edge_std - next_edge_std).mean()
-        late_spread_preserve_pen = F.relu(0.50 * prev_spread - next_spread).mean()
+        late_std_preserve_pen = F.relu(0.60 * prev_edge_std - next_edge_std).mean()
+        late_spread_preserve_pen = F.relu(0.60 * prev_spread - next_spread).mean()
     else:
         late_std_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
         late_spread_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
 
     loss = (
-        1.00 * edge_std_pen
-        + 0.45 * cross_std_pen
-        + 0.45 * intra_std_pen
-        + 0.85 * spread_pen
-        + 0.20 * gap_pen
-        + 0.10 * late_std_preserve_pen
-        + 0.10 * late_spread_preserve_pen
+        1.15 * edge_std_pen
+        + 0.55 * cross_std_pen
+        + 0.55 * intra_std_pen
+        + 1.10 * spread_pen
+        + 0.18 * gap_pen
+        + 0.18 * late_std_preserve_pen
+        + 0.18 * late_spread_preserve_pen
     )
 
     stats = {
@@ -397,7 +397,7 @@ def token_regularization_loss(
     entropy_penalty = (entropy - target_entropy).pow(2).mean()
 
     mean_w = token_weights.mean(dim=0)
-    target_prior = torch.tensor([0.40, 0.20, 0.20, 0.20], device=token_weights.device, dtype=token_weights.dtype)
+    target_prior = torch.tensor([0.37, 0.21, 0.21, 0.21], device=token_weights.device, dtype=token_weights.dtype)
     balance = F.mse_loss(mean_w, target_prior)
 
     shared_w = token_weights[:, 0]
@@ -412,10 +412,10 @@ def token_regularization_loss(
     loss = (
         entropy_penalty
         + 0.35 * balance
-        + 1.25 * shared_floor_penalty
-        + 1.50 * shared_margin_penalty
-        + 1.00 * private_floor_penalty
-        + 1.00 * peak_penalty
+        + 1.10 * shared_floor_penalty
+        + 1.20 * shared_margin_penalty
+        + 0.95 * private_floor_penalty
+        + 0.90 * peak_penalty
     )
     stats = {
         "token_reg_loss": float(loss.item()),
