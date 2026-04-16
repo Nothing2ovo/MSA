@@ -9,11 +9,11 @@ DEFAULT_RENYI_ALPHA = 1.9
 DEFAULT_RENYI_RANK = 10
 DEFAULT_TOKEN_REG_WEIGHT = 2e-2
 DEFAULT_HYPERGRAPH_REG_WEIGHT = 5.5e-2
-DEFAULT_TOKEN_TARGET_ENTROPY = 0.83
-DEFAULT_PRIVATE_MIN_WEIGHT = 0.075
-DEFAULT_SHARED_TARGET_WEIGHT = 0.31
-DEFAULT_SHARED_DOMINANCE_MARGIN = 0.015
-DEFAULT_TOKEN_MAX_WEIGHT = 0.72
+DEFAULT_TOKEN_TARGET_ENTROPY = 0.87
+DEFAULT_PRIVATE_MIN_WEIGHT = 0.055
+DEFAULT_SHARED_TARGET_WEIGHT = 0.27
+DEFAULT_SHARED_DOMINANCE_MARGIN = 0.005
+DEFAULT_TOKEN_MAX_WEIGHT = 0.68
 DEFAULT_EDGE_TARGET_STD = 0.034
 DEFAULT_EDGE_MIN_GAP = 0.013
 DEFAULT_CROSS_EDGE_TARGET_STD = 0.018
@@ -156,13 +156,10 @@ def hypergraph_structure_loss(
     min_edge_spread: float = DEFAULT_EDGE_SPREAD_MARGIN,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    这次只针对超图本身继续加强，核心目标不是“把整体 std 再抬一点”，
-    而是更具体地阻止最后一层/后两层重新塌回近常数边权。
-
-    相比上一版：
-    1) layer 权重更偏向后层；
-    2) 单独约束最后两层的 std / spread；
-    3) 增加 final-vs-early preserve penalty，专门打击“前层有差异、最后一层又抹平”。
+    多层防塌缩超图正则：
+    1) 不再只约束最后一层，而是所有 hypergraph layers 一起约束；
+    2) 重点放在 edge std / edge spread，gap 只作为次级约束；
+    3) 增加后层保形约束，减少“前层有差异、后层又抹平”的二次回缩。
     """
     hyper_aux = aux["hyper_aux"]
 
@@ -204,8 +201,8 @@ def hypergraph_structure_loss(
 
     num_layers = int(per_layer_edge_std.numel())
     layer_weights = torch.linspace(
-        0.72,
-        1.38,
+        0.90,
+        1.10,
         steps=max(1, num_layers),
         device=per_layer_edge_std.device,
         dtype=per_layer_edge_std.dtype,
@@ -221,59 +218,37 @@ def hypergraph_structure_loss(
     gap_pen = weighted_mean(F.relu(min_cross_intra_gap - per_layer_gap))
     spread_pen = weighted_mean(F.relu(min_edge_spread - per_layer_spread))
 
-    tail_k = min(2, max(1, num_layers))
-    tail_edge_std_pen = F.relu(target_edge_std - per_layer_edge_std[-tail_k:]).mean()
-    tail_cross_std_pen = F.relu(target_cross_std - per_layer_cross_std[-tail_k:]).mean()
-    tail_intra_std_pen = F.relu(target_intra_std - per_layer_intra_std[-tail_k:]).mean()
-    tail_spread_pen = F.relu(min_edge_spread - per_layer_spread[-tail_k:]).mean()
-
     if num_layers > 1:
+        # 后层不要比前层塌得太快；允许下降，但不允许急剧回缩
         next_edge_std = per_layer_edge_std[1:]
         prev_edge_std = per_layer_edge_std[:-1]
         next_spread = per_layer_spread[1:]
         prev_spread = per_layer_spread[:-1]
-
-        late_std_preserve_pen = F.relu(0.72 * prev_edge_std - next_edge_std).mean()
-        late_spread_preserve_pen = F.relu(0.72 * prev_spread - next_spread).mean()
-
-        ref_k = min(2, num_layers)
-        early_edge_ref = per_layer_edge_std[:ref_k].mean()
-        early_spread_ref = per_layer_spread[:ref_k].mean()
-        final_edge_std = per_layer_edge_std[-1]
-        final_spread = per_layer_spread[-1]
-
-        final_vs_early_edge_pen = F.relu(0.45 * early_edge_ref - final_edge_std)
-        final_vs_early_spread_pen = F.relu(0.40 * early_spread_ref - final_spread)
+        late_std_preserve_pen = F.relu(0.60 * prev_edge_std - next_edge_std).mean()
+        late_spread_preserve_pen = F.relu(0.60 * prev_spread - next_spread).mean()
     else:
-        zero = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
-        late_std_preserve_pen = zero
-        late_spread_preserve_pen = zero
-        final_vs_early_edge_pen = zero
-        final_vs_early_spread_pen = zero
+        late_std_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
+        late_spread_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
 
     loss = (
-        0.95 * edge_std_pen
-        + 0.42 * cross_std_pen
-        + 0.42 * intra_std_pen
-        + 0.82 * spread_pen
-        + 0.15 * gap_pen
-        + 0.55 * tail_edge_std_pen
-        + 0.20 * tail_cross_std_pen
-        + 0.20 * tail_intra_std_pen
-        + 0.55 * tail_spread_pen
-        + 0.40 * late_std_preserve_pen
-        + 0.40 * late_spread_preserve_pen
-        + 0.32 * final_vs_early_edge_pen
-        + 0.32 * final_vs_early_spread_pen
+        1.15 * edge_std_pen
+        + 0.55 * cross_std_pen
+        + 0.55 * intra_std_pen
+        + 1.10 * spread_pen
+        + 0.18 * gap_pen
+        + 0.18 * late_std_preserve_pen
+        + 0.18 * late_spread_preserve_pen
     )
 
     stats = {
         "hypergraph_reg_loss": float(loss.item()),
+        # backward-compatible keys use multi-layer means now
         "edge_weight_std": float(per_layer_edge_std.mean().item()),
         "cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
         "intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
         "cross_intra_gap": float(per_layer_gap.mean().item()),
         "edge_spread": float(per_layer_spread.mean().item()),
+        # extra diagnostics
         "multi_layer_edge_weight_std": float(per_layer_edge_std.mean().item()),
         "multi_layer_cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
         "multi_layer_intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
@@ -281,10 +256,6 @@ def hypergraph_structure_loss(
         "multi_layer_edge_spread": float(per_layer_spread.mean().item()),
         "late_std_preserve_penalty": float(late_std_preserve_pen.item()),
         "late_spread_preserve_penalty": float(late_spread_preserve_pen.item()),
-        "tail_edge_std_penalty": float(tail_edge_std_pen.item()),
-        "tail_spread_penalty": float(tail_spread_pen.item()),
-        "final_vs_early_edge_penalty": float(final_vs_early_edge_pen.item()),
-        "final_vs_early_spread_penalty": float(final_vs_early_spread_pen.item()),
     }
     return loss, stats
 
@@ -414,10 +385,10 @@ def token_regularization_loss(
     max_weight: float = DEFAULT_TOKEN_MAX_WEIGHT,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    目标从“接近均匀”改成“shared 主导、private 补充”：
-    - shared 至少要站住主导位；
-    - 3 个 private 不能被压死；
-    - 但也不能出现单 token 长期一边倒独占。
+    软先验版 token 正则：
+    - 保留 "shared 主导、text-private 次之" 的总体倾向；
+    - 但不再把分布硬拉回固定模板；
+    - 更强调不过分塌缩、不过分独占，以及 shared/text 的温和排序关系。
     """
     eps = 1e-8
     num_tokens = token_weights.size(1)
@@ -426,25 +397,29 @@ def token_regularization_loss(
     entropy_penalty = (entropy - target_entropy).pow(2).mean()
 
     mean_w = token_weights.mean(dim=0)
-    target_prior = torch.tensor([0.37, 0.21, 0.21, 0.21], device=token_weights.device, dtype=token_weights.dtype)
+    target_prior = torch.tensor([0.34, 0.26, 0.21, 0.19], device=token_weights.device, dtype=token_weights.dtype)
     balance = F.mse_loss(mean_w, target_prior)
 
     shared_w = token_weights[:, 0]
+    text_w = token_weights[:, 1]
     private_w = token_weights[:, 1:]
     max_private = private_w.max(dim=1).values
+    other_private_max = private_w[:, 1:].max(dim=1).values
 
     shared_floor_penalty = F.relu(shared_target_weight - shared_w).mean()
     shared_margin_penalty = F.relu(max_private + shared_margin - shared_w).mean()
     private_floor_penalty = F.relu(private_min_weight - private_w).mean()
+    text_soft_rank_penalty = F.relu(other_private_max + 0.01 - text_w).mean()
     peak_penalty = F.relu(token_weights.max(dim=1).values - max_weight).mean()
 
     loss = (
         entropy_penalty
-        + 0.35 * balance
-        + 1.10 * shared_floor_penalty
-        + 1.20 * shared_margin_penalty
-        + 0.95 * private_floor_penalty
-        + 0.90 * peak_penalty
+        + 0.18 * balance
+        + 0.80 * shared_floor_penalty
+        + 0.65 * shared_margin_penalty
+        + 0.65 * private_floor_penalty
+        + 0.25 * text_soft_rank_penalty
+        + 0.75 * peak_penalty
     )
     stats = {
         "token_reg_loss": float(loss.item()),

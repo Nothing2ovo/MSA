@@ -1,3 +1,4 @@
+import math
 from typing import Dict, Tuple
 
 import torch
@@ -135,10 +136,11 @@ class SparseTMoE(nn.Module):
 
 class TokenLevelDynamicWeighting(nn.Module):
     """
-    目标从“温和但几乎被 text-private 长期占优”改成：
-    1) shared hypergraph token 作为主导锚点；
-    2) private token 作为补充，不允许被压死；
-    3) 最终 token 融合既保留动态性，又带有 shared-dominant 的结构先验。
+    软先验版 4-token 融合：
+    1) 保留 "shared 主导、text-private 次之" 的归纳偏置；
+    2) 但把原先较硬的 prior mix / min floor 改成更柔和的引导；
+    3) 当样本本身已经给出清晰 token 重要性时，优先相信数据；
+       当样本较不确定时，再更多借助先验稳定训练。
     """
     def __init__(
         self,
@@ -146,13 +148,13 @@ class TokenLevelDynamicWeighting(nn.Module):
         private_dim: int,
         token_dim: int = 128,
         dropout: float = 0.1,
-        temperature: float = 1.08,
-        flatten_power: float = 0.95,
-        prior_mix: float = 0.25,
-        shared_min_weight: float = 0.24,
-        private_min_weight: float = 0.09,
-        gate_scale: float = 0.60,
-        shared_to_private_scale: float = 0.10,
+        temperature: float = 1.12,
+        flatten_power: float = 0.98,
+        prior_mix: float = 0.12,
+        shared_min_weight: float = 0.18,
+        private_min_weight: float = 0.05,
+        gate_scale: float = 0.48,
+        shared_to_private_scale: float = 0.08,
     ):
         super().__init__()
         self.temperature = max(1e-3, float(temperature))
@@ -203,8 +205,8 @@ class TokenLevelDynamicWeighting(nn.Module):
             nn.Linear(token_dim, 1),
         )
         self.shared_affinity_proj = nn.Linear(token_dim, token_dim)
-        self.base_prior_logits = nn.Parameter(torch.tensor([0.90, 0.0, 0.0, 0.0], dtype=torch.float32))
-        self.token_bias = nn.Parameter(torch.tensor([0.22, 0.0, 0.0, 0.0], dtype=torch.float32))
+        self.base_prior_logits = nn.Parameter(torch.tensor([0.55, 0.18, 0.00, -0.06], dtype=torch.float32))
+        self.token_bias = nn.Parameter(torch.tensor([0.08, 0.03, 0.00, 0.00], dtype=torch.float32))
         self.out_norm = nn.LayerNorm(token_dim)
 
     def forward(
@@ -246,14 +248,14 @@ class TokenLevelDynamicWeighting(nn.Module):
         )
         private_bonus = torch.cat([
             torch.zeros_like(shared_affinity[:, :1]),
-            0.10 * private_consistency,
+            0.08 * private_consistency,
         ], dim=1)
 
         prior_logits = self.base_prior_logits.view(1, -1)
         token_scores = (
             compat_score
-            + 0.25 * local_score
-            + 0.35 * shared_affinity
+            + 0.22 * local_score
+            + 0.30 * shared_affinity
             + private_bonus
             + self.token_bias.view(1, -1)
             + prior_logits
@@ -265,22 +267,25 @@ class TokenLevelDynamicWeighting(nn.Module):
             token_weights = token_weights / token_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         prior_dist = torch.softmax(self.base_prior_logits, dim=0).view(1, -1)
-        if self.prior_mix > 0.0:
-            token_weights = (1.0 - self.prior_mix) * token_weights + self.prior_mix * prior_dist
+        entropy = -(token_weights * torch.log(token_weights.clamp_min(1e-8))).sum(dim=1)
+        entropy = entropy / math.log(self.num_tokens)
+        adaptive_prior_mix = (self.prior_mix * entropy).unsqueeze(1)
+        token_weights = (1.0 - adaptive_prior_mix) * token_weights + adaptive_prior_mix * prior_dist
 
-        min_floor = torch.tensor(
+        soft_floor = torch.tensor(
             [self.shared_min_weight, self.private_min_weight, self.private_min_weight, self.private_min_weight],
             device=token_weights.device,
             dtype=token_weights.dtype,
         ).view(1, -1)
-        token_weights = torch.maximum(token_weights, min_floor)
+        under_floor = F.relu(soft_floor - token_weights)
+        token_weights = token_weights + 0.35 * under_floor
         token_weights = token_weights / token_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         guided_tokens = typed_tokens.clone()
         guided_tokens[:, 1:, :] = guided_tokens[:, 1:, :] + self.shared_to_private_scale * shared_anchor.unsqueeze(1)
 
         token_scale = 1.0 + self.gate_scale * (token_weights - prior_dist)
-        token_scale = token_scale.clamp(min=0.82, max=1.35)
+        token_scale = token_scale.clamp(min=0.88, max=1.28)
         weighted_tokens = self.out_norm(guided_tokens * token_scale.unsqueeze(-1))
 
         dominance_margin = token_weights[:, 0] - token_weights[:, 1:].max(dim=1).values
@@ -293,6 +298,7 @@ class TokenLevelDynamicWeighting(nn.Module):
             "token_weights": token_weights,
             "token_scale": token_scale,
             "prior_dist": prior_dist.expand(token_weights.size(0), -1),
+            "adaptive_prior_mix": adaptive_prior_mix.expand(token_weights.size(0), -1),
             "dominance_margin": dominance_margin,
             "shared_token": shared_token,
             "text_token": t_token,

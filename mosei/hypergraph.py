@@ -79,12 +79,10 @@ class PaperBatchHypergraphBuilder(nn.Module):
 
 class AntiCollapseHypergraphConv(nn.Module):
     """
-    更针对“中后期边权塌成近常数”的超图卷积：
-    1) 仍保留标准超图归一化传播；
-    2) 基础边权继续由 base slot + content residual 决定；
-    3) 额外加入 content-anchor collapse guard：
-       当某一类边的 logit std 低于阈值时，自动放大一个带内容差异的 anchor 分量，
-       让 edge weight 在 batch 内恢复一定分散度，而不是一路塌到常数。
+    防塌缩版超图卷积：
+    1) 保留论文 Eq.(11) 的标准归一化传播；
+    2) 边权 = 可学习 base logit + 内容感知 residual，不再只靠纯 slot 参数；
+    3) cross / intra 分开建权，打破两类边天然收敛到同一常数的趋势。
     """
     def __init__(
         self,
@@ -114,30 +112,10 @@ class AntiCollapseHypergraphConv(nn.Module):
             nn.GELU(),
             nn.Linear(input_dim, 1),
         )
-
-        # 额外的 anchor 支路：即使主 residual 分支后期变弱，也保留一个内容差异来源
-        self.cross_anchor_mlp = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.GELU(),
-            nn.Linear(input_dim, 1),
-        )
-        self.intra_anchor_mlp = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.GELU(),
-            nn.Linear(input_dim, 1),
-        )
-
         self.cross_res_scale = nn.Parameter(torch.tensor(0.65, dtype=torch.float32))
         self.intra_res_scale = nn.Parameter(torch.tensor(0.65, dtype=torch.float32))
-        self.cross_anchor_scale = nn.Parameter(torch.tensor(0.18, dtype=torch.float32))
-        self.intra_anchor_scale = nn.Parameter(torch.tensor(0.22, dtype=torch.float32))
         self.cross_bias = nn.Parameter(torch.tensor(0.08, dtype=torch.float32))
         self.intra_bias = nn.Parameter(torch.tensor(-0.02, dtype=torch.float32))
-
-        # 只用于“塌缩时自适应增强”的目标下界，不改动外部训练逻辑
-        self.cross_std_floor = 0.030
-        self.intra_std_floor = 0.028
-        self.max_guard_boost = 2.0
 
         self.out_norm = nn.LayerNorm(output_dim)
         self.dropout = nn.Dropout(dropout)
@@ -162,43 +140,6 @@ class AntiCollapseHypergraphConv(nn.Module):
         x = x - x.mean()
         return x / x.std(unbiased=False).clamp_min(1e-4)
 
-    @staticmethod
-    def _safe_std(x: torch.Tensor) -> torch.Tensor:
-        if x.numel() <= 1:
-            return torch.zeros((), device=x.device, dtype=x.dtype)
-        return x.std(unbiased=False)
-
-    def _build_anchor_score(self, edge_repr: torch.Tensor, anchor_mlp: nn.Module) -> torch.Tensor:
-        if edge_repr.numel() == 0:
-            return edge_repr.new_zeros(edge_repr.shape[:-1])
-
-        center = edge_repr.mean(dim=0, keepdim=True)
-        novelty = torch.norm(edge_repr - center, dim=-1)
-        novelty = self._normalize_score(novelty)
-
-        proto = F.normalize(center, dim=-1)
-        align = torch.sum(F.normalize(edge_repr, dim=-1) * proto, dim=-1)
-        diversity = self._normalize_score(-align)
-
-        anchor_raw = anchor_mlp(edge_repr).squeeze(-1) + 0.20 * novelty + 0.15 * diversity
-        return self._normalize_score(anchor_raw)
-
-    def _apply_collapse_guard(
-        self,
-        pre_logits: torch.Tensor,
-        anchor_score: torch.Tensor,
-        std_floor: float,
-        anchor_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        if pre_logits.numel() <= 1:
-            return pre_logits + anchor_scale * anchor_score
-
-        cur_std = self._safe_std(pre_logits)
-        std_floor_t = pre_logits.new_tensor(float(std_floor))
-        deficit = F.relu(std_floor_t - cur_std)
-        boost = 1.0 + self.max_guard_boost * deficit / std_floor_t.clamp_min(1e-6)
-        return pre_logits + anchor_scale * boost * anchor_score
-
     def forward(
         self,
         x: torch.Tensor,
@@ -217,25 +158,9 @@ class AntiCollapseHypergraphConv(nn.Module):
         cross_base, intra_base = self._slice_base_logits(batch_size, seq_len, x.device, x.dtype)
         cross_res = self._normalize_score(self.cross_edge_mlp(cross_repr).squeeze(-1))
         intra_res = self._normalize_score(self.intra_edge_mlp(intra_repr).squeeze(-1))
-        cross_anchor = self._build_anchor_score(cross_repr, self.cross_anchor_mlp)
-        intra_anchor = self._build_anchor_score(intra_repr, self.intra_anchor_mlp)
 
-        cross_pre_logits = cross_base + self.cross_bias + self.cross_res_scale * cross_res
-        intra_pre_logits = intra_base + self.intra_bias + self.intra_res_scale * intra_res
-
-        cross_logits = self._apply_collapse_guard(
-            cross_pre_logits,
-            cross_anchor,
-            std_floor=self.cross_std_floor,
-            anchor_scale=self.cross_anchor_scale,
-        )
-        intra_logits = self._apply_collapse_guard(
-            intra_pre_logits,
-            intra_anchor,
-            std_floor=self.intra_std_floor,
-            anchor_scale=self.intra_anchor_scale,
-        )
-
+        cross_logits = cross_base + self.cross_bias + self.cross_res_scale * cross_res
+        intra_logits = intra_base + self.intra_bias + self.intra_res_scale * intra_res
         edge_logits = torch.cat([cross_logits, intra_logits], dim=0)
         edge_w = F.softplus(edge_logits).clamp_min(1e-6)
 

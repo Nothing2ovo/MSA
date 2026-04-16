@@ -249,7 +249,7 @@ def main() -> None:
     hg_layers = 3
     intra_k = 3
 
-    print("[Config] stronger-hypergraph / slightly-relaxed-4token / mildly-raised-TGIB")
+    print("[Config] restored-hypergraph / soft-prior-4token / mildly-raised-TGIB")
     print(f"[Config] delta={delta:.4f} | mmib_kl={mmib_kl_weight:.6f} | hyper_reg_w={hypergraph_reg_weight:.4f}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
