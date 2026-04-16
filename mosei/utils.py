@@ -156,10 +156,13 @@ def hypergraph_structure_loss(
     min_edge_spread: float = DEFAULT_EDGE_SPREAD_MARGIN,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    多层防塌缩超图正则：
-    1) 不再只约束最后一层，而是所有 hypergraph layers 一起约束；
-    2) 重点放在 edge std / edge spread，gap 只作为次级约束；
-    3) 增加后层保形约束，减少“前层有差异、后层又抹平”的二次回缩。
+    这次只针对超图本身继续加强，核心目标不是“把整体 std 再抬一点”，
+    而是更具体地阻止最后一层/后两层重新塌回近常数边权。
+
+    相比上一版：
+    1) layer 权重更偏向后层；
+    2) 单独约束最后两层的 std / spread；
+    3) 增加 final-vs-early preserve penalty，专门打击“前层有差异、最后一层又抹平”。
     """
     hyper_aux = aux["hyper_aux"]
 
@@ -201,8 +204,8 @@ def hypergraph_structure_loss(
 
     num_layers = int(per_layer_edge_std.numel())
     layer_weights = torch.linspace(
-        0.90,
-        1.10,
+        0.72,
+        1.38,
         steps=max(1, num_layers),
         device=per_layer_edge_std.device,
         dtype=per_layer_edge_std.dtype,
@@ -218,37 +221,59 @@ def hypergraph_structure_loss(
     gap_pen = weighted_mean(F.relu(min_cross_intra_gap - per_layer_gap))
     spread_pen = weighted_mean(F.relu(min_edge_spread - per_layer_spread))
 
+    tail_k = min(2, max(1, num_layers))
+    tail_edge_std_pen = F.relu(target_edge_std - per_layer_edge_std[-tail_k:]).mean()
+    tail_cross_std_pen = F.relu(target_cross_std - per_layer_cross_std[-tail_k:]).mean()
+    tail_intra_std_pen = F.relu(target_intra_std - per_layer_intra_std[-tail_k:]).mean()
+    tail_spread_pen = F.relu(min_edge_spread - per_layer_spread[-tail_k:]).mean()
+
     if num_layers > 1:
-        # 后层不要比前层塌得太快；允许下降，但不允许急剧回缩
         next_edge_std = per_layer_edge_std[1:]
         prev_edge_std = per_layer_edge_std[:-1]
         next_spread = per_layer_spread[1:]
         prev_spread = per_layer_spread[:-1]
-        late_std_preserve_pen = F.relu(0.60 * prev_edge_std - next_edge_std).mean()
-        late_spread_preserve_pen = F.relu(0.60 * prev_spread - next_spread).mean()
+
+        late_std_preserve_pen = F.relu(0.72 * prev_edge_std - next_edge_std).mean()
+        late_spread_preserve_pen = F.relu(0.72 * prev_spread - next_spread).mean()
+
+        ref_k = min(2, num_layers)
+        early_edge_ref = per_layer_edge_std[:ref_k].mean()
+        early_spread_ref = per_layer_spread[:ref_k].mean()
+        final_edge_std = per_layer_edge_std[-1]
+        final_spread = per_layer_spread[-1]
+
+        final_vs_early_edge_pen = F.relu(0.45 * early_edge_ref - final_edge_std)
+        final_vs_early_spread_pen = F.relu(0.40 * early_spread_ref - final_spread)
     else:
-        late_std_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
-        late_spread_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
+        zero = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
+        late_std_preserve_pen = zero
+        late_spread_preserve_pen = zero
+        final_vs_early_edge_pen = zero
+        final_vs_early_spread_pen = zero
 
     loss = (
-        1.15 * edge_std_pen
-        + 0.55 * cross_std_pen
-        + 0.55 * intra_std_pen
-        + 1.10 * spread_pen
-        + 0.18 * gap_pen
-        + 0.18 * late_std_preserve_pen
-        + 0.18 * late_spread_preserve_pen
+        0.95 * edge_std_pen
+        + 0.42 * cross_std_pen
+        + 0.42 * intra_std_pen
+        + 0.82 * spread_pen
+        + 0.15 * gap_pen
+        + 0.55 * tail_edge_std_pen
+        + 0.20 * tail_cross_std_pen
+        + 0.20 * tail_intra_std_pen
+        + 0.55 * tail_spread_pen
+        + 0.40 * late_std_preserve_pen
+        + 0.40 * late_spread_preserve_pen
+        + 0.32 * final_vs_early_edge_pen
+        + 0.32 * final_vs_early_spread_pen
     )
 
     stats = {
         "hypergraph_reg_loss": float(loss.item()),
-        # backward-compatible keys use multi-layer means now
         "edge_weight_std": float(per_layer_edge_std.mean().item()),
         "cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
         "intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
         "cross_intra_gap": float(per_layer_gap.mean().item()),
         "edge_spread": float(per_layer_spread.mean().item()),
-        # extra diagnostics
         "multi_layer_edge_weight_std": float(per_layer_edge_std.mean().item()),
         "multi_layer_cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
         "multi_layer_intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
@@ -256,6 +281,10 @@ def hypergraph_structure_loss(
         "multi_layer_edge_spread": float(per_layer_spread.mean().item()),
         "late_std_preserve_penalty": float(late_std_preserve_pen.item()),
         "late_spread_preserve_penalty": float(late_spread_preserve_pen.item()),
+        "tail_edge_std_penalty": float(tail_edge_std_pen.item()),
+        "tail_spread_penalty": float(tail_spread_pen.item()),
+        "final_vs_early_edge_penalty": float(final_vs_early_edge_pen.item()),
+        "final_vs_early_spread_penalty": float(final_vs_early_spread_pen.item()),
     }
     return loss, stats
 
