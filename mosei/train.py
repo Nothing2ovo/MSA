@@ -54,6 +54,27 @@ def compute_ib_weight_schedule(epoch: int, warmup_epochs: int, ramp_epochs: int,
     return max_delta * progress
 
 
+def compute_sim_aux_weight_schedule(epoch: int, base_alpha: float) -> float:
+    """
+    对后期已经接近 margin floor 的 sim loss 做保守降权：
+    - 前期保持原权重，让 shared/private 对齐先学起来；
+    - 中期开始缓慢衰减，避免后期几乎恒定的 0.20 sim loss 继续主导梯度；
+    - 后期保留一个很小的下限，不直接归零，防止完全失去模态对齐约束。
+    """
+    if epoch < 6:
+        return base_alpha
+    if epoch < 10:
+        progress = (epoch - 6 + 1) / 4.0
+        return base_alpha + (0.030 - base_alpha) * progress
+    if epoch < 14:
+        progress = (epoch - 10 + 1) / 4.0
+        return 0.030 + (0.015 - 0.030) * progress
+    if epoch < 18:
+        progress = (epoch - 14 + 1) / 4.0
+        return 0.015 + (0.008 - 0.015) * progress
+    return 0.008
+
+
 def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) -> None:
     epochs = range(1, len(history["train_total_loss"]) + 1)
 
@@ -160,6 +181,7 @@ def print_epoch_summary(
     epoch: int,
     num_epochs: int,
     lr: float,
+    sim_alpha: float,
     ib_delta: float,
     train_stats: Dict[str, float],
     valid_metrics: Dict[str, float],
@@ -170,6 +192,7 @@ def print_epoch_summary(
 ) -> None:
     print(f"\n[Epoch {epoch + 1:02d}/{num_epochs}]")
     print(f"  lr              = {lr:.6f}")
+    print(f"  sim alpha       = {sim_alpha:.4f}")
     print(f"  tgib delta      = {ib_delta:.4f}")
     print(
         f"  train total/task= {train_stats['train_total_loss']:.4f} / {train_stats['train_task_loss']:.4f} | "
@@ -249,8 +272,8 @@ def main() -> None:
     hg_layers = 3
     intra_k = 3
 
-    print("[Config] restored-hypergraph / soft-prior-4token / mildly-raised-TGIB")
-    print(f"[Config] delta={delta:.4f} | mmib_kl={mmib_kl_weight:.6f} | hyper_reg_w={hypergraph_reg_weight:.4f}")
+    print("[Config] restored-hypergraph / soft-prior-4token / mildly-raised-TGIB / late-sim-decay")
+    print(f"[Config] alpha={alpha:.4f} -> late floor 0.0080 | delta={delta:.4f} | mmib_kl={mmib_kl_weight:.6f} | hyper_reg_w={hypergraph_reg_weight:.4f}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"seed: {seed} | deterministic: {deterministic}")
@@ -313,6 +336,7 @@ def main() -> None:
     }
 
     for epoch in range(num_epochs):
+        current_alpha = compute_sim_aux_weight_schedule(epoch=epoch, base_alpha=alpha)
         current_delta = compute_ib_weight_schedule(epoch=epoch, warmup_epochs=ib_warmup_epochs, ramp_epochs=ib_ramp_epochs, max_delta=delta)
 
         train_stats = train_one_epoch(
@@ -320,7 +344,7 @@ def main() -> None:
             train_loader,
             optimizer,
             device,
-            alpha=alpha,
+            alpha=current_alpha,
             beta=beta,
             gamma=gamma,
             delta=current_delta,
@@ -337,7 +361,7 @@ def main() -> None:
             model,
             valid_loader,
             device,
-            alpha=alpha,
+            alpha=current_alpha,
             beta=beta,
             gamma=gamma,
             delta=current_delta,
@@ -386,6 +410,7 @@ def main() -> None:
             epoch=epoch,
             num_epochs=num_epochs,
             lr=optimizer.param_groups[0]["lr"],
+            sim_alpha=current_alpha,
             ib_delta=current_delta,
             train_stats=train_stats,
             valid_metrics=valid_metrics,
