@@ -7,14 +7,11 @@ import torch.nn.functional as F
 
 class PaperBatchHypergraphBuilder(nn.Module):
     """
-    论文对齐的序列级超图构造：
-    1) 只对 shared(modality-irrelevant) 序列建图；
-    2) cross-modal hyperedge: 同一样本、同一时间位置上的 t/v/a 三个节点；
-    3) intra-modal hyperedge: 当前 batch 内，同一模态节点与其 top-k 近邻节点构成超边。
-
-    输入: shared_seq [B, 3, T, D]
-    输出: incidence matrix H [N, E]
-    其中 N = B * 3 * T, E = B * T + 3 * B * T
+    Paper-aligned sequence-level hypergraph construction.
+    Input: shared_seq [B, 3, T, D]
+    Output: incidence matrix H [N, E], where:
+      N = B * 3 * T
+      E = B * T + 3 * B * T
     """
     def __init__(self, intra_k: int = 3):
         super().__init__()
@@ -30,7 +27,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
 
     def forward(self, shared_seq: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size, num_modalities, seq_len, feat_dim = shared_seq.shape
-        assert num_modalities == 3, 'Only text/vision/audio are supported.'
+        assert num_modalities == 3, "Only text/vision/audio are supported."
         device = shared_seq.device
         dtype = shared_seq.dtype
 
@@ -41,7 +38,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
 
         H = torch.zeros(num_nodes, num_edges, device=device, dtype=dtype)
 
-        # cross-modal hyperedges
+        # cross-modal hyperedges: three modality nodes at the same sample/time step
         e = 0
         for b in range(batch_size):
             for t in range(seq_len):
@@ -49,7 +46,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
                     H[self._node_index(b, m, t, seq_len), e] = 1.0
                 e += 1
 
-        # intra-modal hyperedges: batch 内同模态 top-k 近邻
+        # intra-modal hyperedges: current node + top-k neighbors in the same modality inside the batch
         for m in range(num_modalities):
             feats = shared_seq[:, m, :, :].reshape(batch_size * seq_len, feat_dim)
             feats = F.normalize(feats, dim=-1)
@@ -67,22 +64,22 @@ class PaperBatchHypergraphBuilder(nn.Module):
                     H[self._node_index(nb_b, m, nb_t, seq_len), edge_id] = 1.0
 
         aux = {
-            'num_nodes': torch.tensor(float(num_nodes), device=device),
-            'num_edges': torch.tensor(float(num_edges), device=device),
-            'cross_edges': torch.tensor(float(cross_edges), device=device),
-            'intra_edges': torch.tensor(float(intra_edges), device=device),
-            'batch_size': torch.tensor(float(batch_size), device=device),
-            'seq_len': torch.tensor(float(seq_len), device=device),
+            "num_nodes": torch.tensor(float(num_nodes), device=device),
+            "num_edges": torch.tensor(float(num_edges), device=device),
+            "cross_edges": torch.tensor(float(cross_edges), device=device),
+            "intra_edges": torch.tensor(float(intra_edges), device=device),
+            "batch_size": torch.tensor(float(batch_size), device=device),
+            "seq_len": torch.tensor(float(seq_len), device=device),
         }
         return H, aux
 
 
-class AntiCollapseHypergraphConv(nn.Module):
+class PaperHypergraphConv(nn.Module):
     """
-    防塌缩版超图卷积：
-    1) 保留论文 Eq.(11) 的标准归一化传播；
-    2) 边权 = 可学习 base logit + 内容感知 residual，不再只靠纯 slot 参数；
-    3) cross / intra 分开建权，打破两类边天然收敛到同一常数的趋势。
+    Paper-aligned normalized hypergraph aggregation (Eq. 11):
+        N^{l+1} = rho(D_n^{-1/2} H W D_e^{-1} H^T D_n^{-1/2} N^{l} theta)
+
+    W is implemented as a learnable diagonal vector over hyperedges.
     """
     def __init__(
         self,
@@ -95,87 +92,38 @@ class AntiCollapseHypergraphConv(nn.Module):
         super().__init__()
         self.max_batch_size = int(max_batch_size)
         self.max_seq_len = int(max_seq_len)
+        self.max_edges = 4 * self.max_batch_size * self.max_seq_len
+
         self.theta = nn.Linear(input_dim, output_dim)
+        self.edge_logits = nn.Parameter(torch.zeros(self.max_edges))
+        nn.init.normal_(self.edge_logits, mean=0.0, std=0.02)
 
-        self.cross_edge_logits = nn.Parameter(torch.empty(self.max_batch_size, self.max_seq_len))
-        self.intra_edge_logits = nn.Parameter(torch.empty(3, self.max_batch_size, self.max_seq_len))
-        nn.init.normal_(self.cross_edge_logits, mean=0.18, std=0.08)
-        nn.init.normal_(self.intra_edge_logits, mean=-0.05, std=0.08)
-
-        self.cross_edge_mlp = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.GELU(),
-            nn.Linear(input_dim, 1),
-        )
-        self.intra_edge_mlp = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.GELU(),
-            nn.Linear(input_dim, 1),
-        )
-        self.cross_res_scale = nn.Parameter(torch.tensor(0.65, dtype=torch.float32))
-        self.intra_res_scale = nn.Parameter(torch.tensor(0.65, dtype=torch.float32))
-        self.cross_bias = nn.Parameter(torch.tensor(0.08, dtype=torch.float32))
-        self.intra_bias = nn.Parameter(torch.tensor(-0.02, dtype=torch.float32))
-
-        self.out_norm = nn.LayerNorm(output_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def _slice_base_logits(self, batch_size: int, seq_len: int, device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-        if batch_size > self.max_batch_size or seq_len > self.max_seq_len:
+    def _slice_edge_weights(self, num_edges: int, device, dtype) -> torch.Tensor:
+        if num_edges > self.max_edges:
             raise ValueError(
-                f'Current batch/seq ({batch_size}, {seq_len}) exceeds configured max '
-                f'({self.max_batch_size}, {self.max_seq_len}).'
+                f"Current number of edges {num_edges} exceeds configured maximum {self.max_edges}."
             )
-        cross_logits = self.cross_edge_logits[:batch_size, :seq_len].reshape(-1)
-        intra_logits = self.intra_edge_logits[:, :batch_size, :seq_len].reshape(-1)
-        return (
-            cross_logits.to(device=device, dtype=dtype),
-            intra_logits.to(device=device, dtype=dtype),
-        )
+        logits = self.edge_logits[:num_edges].to(device=device, dtype=dtype)
+        return F.softplus(logits).clamp_min(1e-6)
 
-    @staticmethod
-    def _normalize_score(x: torch.Tensor) -> torch.Tensor:
-        if x.numel() <= 1:
-            return torch.zeros_like(x)
-        x = x - x.mean()
-        return x / x.std(unbiased=False).clamp_min(1e-4)
+    def forward(self, x: torch.Tensor, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_edges = H.size(1)
+        edge_w = self._slice_edge_weights(num_edges, x.device, x.dtype)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        H: torch.Tensor,
-        batch_size: int,
-        seq_len: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Ht = H.transpose(0, 1)
         de = H.sum(dim=0).clamp_min(1.0)
-        num_cross = batch_size * seq_len
-
-        edge_repr = torch.matmul(Ht, x) / de.unsqueeze(-1)
-        cross_repr = edge_repr[:num_cross]
-        intra_repr = edge_repr[num_cross:]
-
-        cross_base, intra_base = self._slice_base_logits(batch_size, seq_len, x.device, x.dtype)
-        cross_res = self._normalize_score(self.cross_edge_mlp(cross_repr).squeeze(-1))
-        intra_res = self._normalize_score(self.intra_edge_mlp(intra_repr).squeeze(-1))
-
-        cross_logits = cross_base + self.cross_bias + self.cross_res_scale * cross_res
-        intra_logits = intra_base + self.intra_bias + self.intra_res_scale * intra_res
-        edge_logits = torch.cat([cross_logits, intra_logits], dim=0)
-        edge_w = F.softplus(edge_logits).clamp_min(1e-6)
-
         dv = torch.matmul(H, edge_w.unsqueeze(-1)).squeeze(-1).clamp_min(1e-6)
-        dv_inv_sqrt = torch.rsqrt(dv)
         de_inv = 1.0 / de
+        dv_inv_sqrt = torch.rsqrt(dv)
 
         x_theta = self.theta(x)
         x_norm = dv_inv_sqrt.unsqueeze(-1) * x_theta
-        edge_msg = torch.matmul(Ht, x_norm)
-        edge_msg = de_inv.unsqueeze(-1) * edge_w.unsqueeze(-1) * edge_msg
+        edge_repr = torch.matmul(H.transpose(0, 1), x_norm)
+        edge_msg = de_inv.unsqueeze(-1) * edge_w.unsqueeze(-1) * edge_repr
         node_msg = torch.matmul(H, edge_msg)
-        node_msg = dv_inv_sqrt.unsqueeze(-1) * node_msg
-
-        out = self.out_norm(x_theta + self.dropout(F.gelu(node_msg)))
+        out = F.gelu(dv_inv_sqrt.unsqueeze(-1) * node_msg)
+        out = self.dropout(out)
         return out, edge_w, edge_repr
 
 
@@ -199,7 +147,7 @@ class HypergraphEncoder(nn.Module):
             nn.Dropout(dropout),
         )
         self.layers = nn.ModuleList([
-            AntiCollapseHypergraphConv(
+            PaperHypergraphConv(
                 hidden_dim,
                 hidden_dim,
                 max_batch_size=max_batch_size,
@@ -208,12 +156,6 @@ class HypergraphEncoder(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        self.node_readout = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.dropout = nn.Dropout(dropout)
 
     @staticmethod
     def _compute_edge_stats(edge_w: torch.Tensor, num_cross: int) -> Dict[str, torch.Tensor]:
@@ -225,7 +167,7 @@ class HypergraphEncoder(nn.Module):
         cross_std = cross_w.std(unbiased=False) if cross_w.numel() > 1 else zero
         intra_std = intra_w.std(unbiased=False) if intra_w.numel() > 1 else zero
         edge_std = edge_w.std(unbiased=False) if edge_w.numel() > 1 else zero
-        cross_intra_gap = cross_mean - intra_mean
+        cross_intra_gap = torch.abs(cross_mean - intra_mean)
         if edge_w.numel() >= 4:
             k = max(1, edge_w.numel() // 10)
             top_mean = torch.topk(edge_w, k=k).values.mean()
@@ -234,13 +176,13 @@ class HypergraphEncoder(nn.Module):
         else:
             edge_spread = zero
         return {
-            'cross_edge_weight_mean': cross_mean,
-            'intra_edge_weight_mean': intra_mean,
-            'cross_edge_weight_std': cross_std,
-            'intra_edge_weight_std': intra_std,
-            'edge_weight_std': edge_std,
-            'cross_intra_gap': cross_intra_gap,
-            'edge_spread': edge_spread,
+            "cross_edge_weight_mean": cross_mean,
+            "intra_edge_weight_mean": intra_mean,
+            "cross_edge_weight_std": cross_std,
+            "intra_edge_weight_std": intra_std,
+            "edge_weight_std": edge_std,
+            "cross_intra_gap": cross_intra_gap,
+            "edge_spread": edge_spread,
         }
 
     def forward(self, shared_seq: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -250,71 +192,31 @@ class HypergraphEncoder(nn.Module):
 
         edge_weights_per_layer: List[torch.Tensor] = []
         edge_repr_per_layer: List[torch.Tensor] = []
-        layer_cross_means: List[torch.Tensor] = []
-        layer_intra_means: List[torch.Tensor] = []
-        layer_cross_stds: List[torch.Tensor] = []
-        layer_intra_stds: List[torch.Tensor] = []
-        layer_edge_stds: List[torch.Tensor] = []
-        layer_gaps: List[torch.Tensor] = []
-        layer_spreads: List[torch.Tensor] = []
+        layer_stats: List[Dict[str, torch.Tensor]] = []
 
         num_cross = batch_size * seq_len
         for layer in self.layers:
-            x, edge_w, edge_repr = layer(x, H, batch_size=batch_size, seq_len=seq_len)
+            x, edge_w, edge_repr = layer(x, H)
             edge_weights_per_layer.append(edge_w)
             edge_repr_per_layer.append(edge_repr)
-            stats = self._compute_edge_stats(edge_w, num_cross)
-            layer_cross_means.append(stats['cross_edge_weight_mean'])
-            layer_intra_means.append(stats['intra_edge_weight_mean'])
-            layer_cross_stds.append(stats['cross_edge_weight_std'])
-            layer_intra_stds.append(stats['intra_edge_weight_std'])
-            layer_edge_stds.append(stats['edge_weight_std'])
-            layer_gaps.append(stats['cross_intra_gap'])
-            layer_spreads.append(stats['edge_spread'])
+            layer_stats.append(self._compute_edge_stats(edge_w, num_cross=num_cross))
 
         node_out = x.view(batch_size, 3, seq_len, -1)
-        modality_repr = node_out.mean(dim=2)
-        score = self.node_readout(modality_repr).squeeze(-1)
-        node_attn = torch.softmax(score, dim=-1)
-        graph_repr = torch.sum(node_attn.unsqueeze(-1) * modality_repr, dim=1)
-        graph_repr = self.dropout(graph_repr)
-
-        per_layer_cross_means = torch.stack(layer_cross_means)
-        per_layer_intra_means = torch.stack(layer_intra_means)
-        per_layer_cross_stds = torch.stack(layer_cross_stds)
-        per_layer_intra_stds = torch.stack(layer_intra_stds)
-        per_layer_edge_stds = torch.stack(layer_edge_stds)
-        per_layer_gaps = torch.stack(layer_gaps)
-        per_layer_spreads = torch.stack(layer_spreads)
+        modality_repr = node_out.mean(dim=2)  # [B, 3, hidden]
 
         aux = {
-            'incidence_matrix': H,
-            'node_output': node_out,
-            'modality_output': modality_repr,
-            'graph_repr': graph_repr,
-            'node_attn': node_attn,
-            'edge_weights_per_layer': edge_weights_per_layer,
-            'edge_repr_per_layer': edge_repr_per_layer,
-            'per_layer_cross_edge_weight_mean': per_layer_cross_means,
-            'per_layer_intra_edge_weight_mean': per_layer_intra_means,
-            'per_layer_cross_edge_weight_std': per_layer_cross_stds,
-            'per_layer_intra_edge_weight_std': per_layer_intra_stds,
-            'per_layer_edge_weight_std': per_layer_edge_stds,
-            'per_layer_cross_intra_gap': per_layer_gaps,
-            'per_layer_edge_spread': per_layer_spreads,
-            # keep existing keys as last-layer values for backward-compatible logging
-            'cross_edge_weight_mean': per_layer_cross_means[-1],
-            'intra_edge_weight_mean': per_layer_intra_means[-1],
-            'cross_edge_weight_std': per_layer_cross_stds[-1],
-            'intra_edge_weight_std': per_layer_intra_stds[-1],
-            'edge_weight_std': per_layer_edge_stds[-1],
-            'cross_intra_gap': per_layer_gaps[-1],
-            'edge_spread': per_layer_spreads[-1],
-            'multi_layer_cross_edge_weight_mean': per_layer_cross_means.mean(),
-            'multi_layer_intra_edge_weight_mean': per_layer_intra_means.mean(),
-            'multi_layer_edge_weight_std': per_layer_edge_stds.mean(),
-            'multi_layer_cross_intra_gap': per_layer_gaps.mean(),
-            'multi_layer_edge_spread': per_layer_spreads.mean(),
+            "incidence_matrix": H,
+            "node_output": node_out,
+            "modality_output": modality_repr,
+            "edge_weights_per_layer": edge_weights_per_layer,
+            "edge_repr_per_layer": edge_repr_per_layer,
+            "cross_edge_weight_mean": layer_stats[-1]["cross_edge_weight_mean"],
+            "intra_edge_weight_mean": layer_stats[-1]["intra_edge_weight_mean"],
+            "cross_edge_weight_std": layer_stats[-1]["cross_edge_weight_std"],
+            "intra_edge_weight_std": layer_stats[-1]["intra_edge_weight_std"],
+            "edge_weight_std": layer_stats[-1]["edge_weight_std"],
+            "cross_intra_gap": layer_stats[-1]["cross_intra_gap"],
+            "edge_spread": layer_stats[-1]["edge_spread"],
             **graph_meta,
         }
-        return graph_repr, aux
+        return modality_repr, aux
