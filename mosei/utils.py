@@ -5,6 +5,20 @@ import torch
 import torch.nn.functional as F
 
 DEFAULT_MOE_BALANCE_WEIGHT = 1e-2
+DEFAULT_RENYI_ALPHA = 1.9
+DEFAULT_RENYI_RANK = 10
+DEFAULT_TOKEN_REG_WEIGHT = 2e-2
+DEFAULT_HYPERGRAPH_REG_WEIGHT = 5.5e-2
+DEFAULT_TOKEN_TARGET_ENTROPY = 0.87
+DEFAULT_PRIVATE_MIN_WEIGHT = 0.055
+DEFAULT_SHARED_TARGET_WEIGHT = 0.27
+DEFAULT_SHARED_DOMINANCE_MARGIN = 0.005
+DEFAULT_TOKEN_MAX_WEIGHT = 0.68
+DEFAULT_EDGE_TARGET_STD = 0.034
+DEFAULT_EDGE_MIN_GAP = 0.013
+DEFAULT_CROSS_EDGE_TARGET_STD = 0.018
+DEFAULT_INTRA_EDGE_TARGET_STD = 0.018
+DEFAULT_EDGE_SPREAD_MARGIN = 0.050
 
 
 def compute_mae(preds: torch.Tensor, labels: torch.Tensor) -> float:
@@ -94,7 +108,6 @@ def _cross_modal_triplet(anchor: torch.Tensor, positive: torch.Tensor, labels: t
 
 
 def similarity_loss(aux: Dict[str, torch.Tensor], labels: torch.Tensor, margin: float = 0.2) -> torch.Tensor:
-    # pool each sequence to one utterance-level representation for the triplet loss
     e_irr_t = aux["e_irr_t"].mean(dim=1)
     e_irr_v = aux["e_irr_v"].mean(dim=1)
     e_irr_a = aux["e_irr_a"].mean(dim=1)
@@ -125,13 +138,301 @@ def cv_squared(x: torch.Tensor) -> torch.Tensor:
 
 
 def moe_load_loss(aux: Dict[str, torch.Tensor], balance_weight: float = DEFAULT_MOE_BALANCE_WEIGHT) -> torch.Tensor:
-    # Paper Eq. (14): sum over modalities rather than averaging.
     losses = []
     for key in ["tmoe_t_aux", "tmoe_v_aux", "tmoe_a_aux"]:
         importance = aux[key]["importance"]
         load = aux[key]["load"]
         losses.append(balance_weight * (cv_squared(importance) + cv_squared(load)))
-    return sum(losses)
+    return sum(losses) / len(losses)
+
+
+
+def hypergraph_structure_loss(
+    aux: Dict[str, torch.Tensor],
+    target_edge_std: float = DEFAULT_EDGE_TARGET_STD,
+    min_cross_intra_gap: float = DEFAULT_EDGE_MIN_GAP,
+    target_cross_std: float = DEFAULT_CROSS_EDGE_TARGET_STD,
+    target_intra_std: float = DEFAULT_INTRA_EDGE_TARGET_STD,
+    min_edge_spread: float = DEFAULT_EDGE_SPREAD_MARGIN,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    多层防塌缩超图正则：
+    1) 不再只约束最后一层，而是所有 hypergraph layers 一起约束；
+    2) 重点放在 edge std / edge spread，gap 只作为次级约束；
+    3) 增加后层保形约束，减少“前层有差异、后层又抹平”的二次回缩。
+    """
+    hyper_aux = aux["hyper_aux"]
+
+    if "per_layer_edge_weight_std" in hyper_aux:
+        per_layer_edge_std = hyper_aux["per_layer_edge_weight_std"]
+        per_layer_cross_std = hyper_aux["per_layer_cross_edge_weight_std"]
+        per_layer_intra_std = hyper_aux["per_layer_intra_edge_weight_std"]
+        per_layer_gap = hyper_aux["per_layer_cross_intra_gap"].abs()
+        per_layer_spread = hyper_aux["per_layer_edge_spread"]
+    else:
+        num_cross = int(hyper_aux["cross_edges"].item())
+        edge_stds = []
+        cross_stds = []
+        intra_stds = []
+        gaps = []
+        spreads = []
+        zero = None
+        for edge_w in hyper_aux["edge_weights_per_layer"]:
+            if zero is None:
+                zero = torch.zeros((), device=edge_w.device, dtype=edge_w.dtype)
+            cross_w = edge_w[:num_cross]
+            intra_w = edge_w[num_cross:]
+            edge_stds.append(edge_w.std(unbiased=False) if edge_w.numel() > 1 else zero)
+            cross_stds.append(cross_w.std(unbiased=False) if cross_w.numel() > 1 else zero)
+            intra_stds.append(intra_w.std(unbiased=False) if intra_w.numel() > 1 else zero)
+            gaps.append(torch.abs(cross_w.mean() - intra_w.mean()) if cross_w.numel() > 0 and intra_w.numel() > 0 else zero)
+            if edge_w.numel() >= 4:
+                k = max(1, edge_w.numel() // 10)
+                top_mean = torch.topk(edge_w, k=k).values.mean()
+                bottom_mean = torch.topk(edge_w, k=k, largest=False).values.mean()
+                spreads.append(top_mean - bottom_mean)
+            else:
+                spreads.append(zero)
+        per_layer_edge_std = torch.stack(edge_stds)
+        per_layer_cross_std = torch.stack(cross_stds)
+        per_layer_intra_std = torch.stack(intra_stds)
+        per_layer_gap = torch.stack(gaps)
+        per_layer_spread = torch.stack(spreads)
+
+    num_layers = int(per_layer_edge_std.numel())
+    layer_weights = torch.linspace(
+        0.90,
+        1.10,
+        steps=max(1, num_layers),
+        device=per_layer_edge_std.device,
+        dtype=per_layer_edge_std.dtype,
+    )
+    layer_weights = layer_weights / layer_weights.sum().clamp_min(1e-8)
+
+    def weighted_mean(x: torch.Tensor) -> torch.Tensor:
+        return torch.sum(layer_weights * x)
+
+    edge_std_pen = weighted_mean(F.relu(target_edge_std - per_layer_edge_std))
+    cross_std_pen = weighted_mean(F.relu(target_cross_std - per_layer_cross_std))
+    intra_std_pen = weighted_mean(F.relu(target_intra_std - per_layer_intra_std))
+    gap_pen = weighted_mean(F.relu(min_cross_intra_gap - per_layer_gap))
+    spread_pen = weighted_mean(F.relu(min_edge_spread - per_layer_spread))
+
+    if num_layers > 1:
+        # 后层不要比前层塌得太快；允许下降，但不允许急剧回缩
+        next_edge_std = per_layer_edge_std[1:]
+        prev_edge_std = per_layer_edge_std[:-1]
+        next_spread = per_layer_spread[1:]
+        prev_spread = per_layer_spread[:-1]
+        late_std_preserve_pen = F.relu(0.60 * prev_edge_std - next_edge_std).mean()
+        late_spread_preserve_pen = F.relu(0.60 * prev_spread - next_spread).mean()
+    else:
+        late_std_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
+        late_spread_preserve_pen = torch.zeros((), device=per_layer_edge_std.device, dtype=per_layer_edge_std.dtype)
+
+    loss = (
+        1.15 * edge_std_pen
+        + 0.55 * cross_std_pen
+        + 0.55 * intra_std_pen
+        + 1.10 * spread_pen
+        + 0.18 * gap_pen
+        + 0.18 * late_std_preserve_pen
+        + 0.18 * late_spread_preserve_pen
+    )
+
+    stats = {
+        "hypergraph_reg_loss": float(loss.item()),
+        # backward-compatible keys use multi-layer means now
+        "edge_weight_std": float(per_layer_edge_std.mean().item()),
+        "cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
+        "intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
+        "cross_intra_gap": float(per_layer_gap.mean().item()),
+        "edge_spread": float(per_layer_spread.mean().item()),
+        # extra diagnostics
+        "multi_layer_edge_weight_std": float(per_layer_edge_std.mean().item()),
+        "multi_layer_cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
+        "multi_layer_intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
+        "multi_layer_cross_intra_gap": float(per_layer_gap.mean().item()),
+        "multi_layer_edge_spread": float(per_layer_spread.mean().item()),
+        "late_std_preserve_penalty": float(late_std_preserve_pen.item()),
+        "late_spread_preserve_penalty": float(late_spread_preserve_pen.item()),
+    }
+    return loss, stats
+
+
+def pairwise_sq_dist(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() > 2:
+        x = x.reshape(x.size(0), -1)
+    x = torch.nan_to_num(x.float(), nan=0.0, posinf=1e4, neginf=-1e4).contiguous()
+    dist = torch.cdist(x, x, p=2)
+    return dist.pow(2)
+
+
+def _estimate_sigma2_from_batch(dist2: torch.Tensor) -> torch.Tensor:
+    n = dist2.size(0)
+    if n <= 1:
+        return torch.tensor(1.0, device=dist2.device, dtype=dist2.dtype)
+    dist = torch.sqrt(dist2.clamp_min(1e-12))
+    masked = dist + torch.eye(n, device=dist.device, dtype=dist.dtype) * 1e9
+    k = min(5, n - 1)
+    knn = torch.topk(masked, k=k, largest=False, dim=-1).values
+    sigma = torch.nan_to_num(knn.mean(), nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1e-4)
+    return sigma.pow(2)
+
+
+def normalized_gaussian_gram(x: torch.Tensor, sigma2: torch.Tensor = None) -> torch.Tensor:
+    if x.dim() > 2:
+        x = x.reshape(x.size(0), -1)
+    n = x.size(0)
+    if n == 1:
+        return torch.ones(1, 1, device=x.device, dtype=torch.float32)
+
+    x = torch.nan_to_num(x.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    dist2 = pairwise_sq_dist(x)
+    if sigma2 is None:
+        sigma2 = _estimate_sigma2_from_batch(dist2)
+
+    gram = torch.exp(-(dist2 / (sigma2 + 1e-8)).clamp(max=50.0))
+    gram = torch.nan_to_num(gram, nan=0.0, posinf=1.0, neginf=0.0)
+    gram = 0.5 * (gram + gram.t())
+    gram = gram + 1e-6 * torch.eye(n, device=gram.device, dtype=gram.dtype)
+    gram = gram / torch.trace(gram).clamp_min(1e-8)
+    gram = 0.5 * (gram + gram.t())
+    return gram
+
+
+def low_rank_renyi_entropy(gram: torch.Tensor, alpha: float = DEFAULT_RENYI_ALPHA, rank_k: int = DEFAULT_RENYI_RANK) -> torch.Tensor:
+    n = gram.size(0)
+    if n <= 1:
+        return torch.zeros((), device=gram.device, dtype=gram.dtype)
+
+    gram_safe = torch.nan_to_num(gram.float(), nan=0.0, posinf=1.0, neginf=0.0)
+    gram_safe = 0.5 * (gram_safe + gram_safe.t())
+    gram_safe = gram_safe + 1e-6 * torch.eye(n, device=gram_safe.device, dtype=gram_safe.dtype)
+    gram_safe = gram_safe / torch.trace(gram_safe).clamp_min(1e-8)
+
+    evals = torch.linalg.eigvalsh(gram_safe.to(device="cpu", dtype=torch.float64))
+    evals = torch.flip(evals, dims=[0]).clamp_min(1e-12)
+    evals = evals.to(device=gram.device, dtype=gram.dtype)
+
+    if rank_k >= n:
+        val = torch.sum(evals.pow(alpha))
+        return torch.log2(val.clamp_min(1e-12)) / (1.0 - alpha)
+
+    top = evals[:rank_k]
+    remain_mass = (1.0 - top.sum()).clamp_min(1e-12)
+    lambda_r = remain_mass / max(1, n - rank_k)
+    val = top.pow(alpha).sum() + max(1, n - rank_k) * lambda_r.pow(alpha)
+    return torch.log2(val.clamp_min(1e-12)) / (1.0 - alpha)
+
+
+def low_rank_renyi_mutual_information(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    alpha: float = DEFAULT_RENYI_ALPHA,
+    rank_k: int = DEFAULT_RENYI_RANK,
+) -> torch.Tensor:
+    if x.size(0) <= 1:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+
+    a = normalized_gaussian_gram(x)
+    b = normalized_gaussian_gram(z)
+    joint = a * b
+    joint = joint / torch.trace(joint).clamp_min(1e-8)
+    joint = 0.5 * (joint + joint.t())
+
+    h_a = low_rank_renyi_entropy(a, alpha=alpha, rank_k=rank_k)
+    h_b = low_rank_renyi_entropy(b, alpha=alpha, rank_k=rank_k)
+    h_joint = low_rank_renyi_entropy(joint, alpha=alpha, rank_k=rank_k)
+    mi = h_a + h_b - h_joint
+    return mi.clamp_min(0.0)
+
+
+def transformer_guided_ib_loss(
+    preds: torch.Tensor,
+    labels: torch.Tensor,
+    aux: Dict[str, torch.Tensor],
+    alpha: float = DEFAULT_RENYI_ALPHA,
+    rank_k: int = DEFAULT_RENYI_RANK,
+    mae_weight: float = 1.0,
+    kl_weight: float = 1e-4,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    pre_ib = aux["fused_repr"]
+    z = aux["filtered_repr"]
+    mi_term = low_rank_renyi_mutual_information(pre_ib, z, alpha=alpha, rank_k=rank_k)
+
+    mu = aux["tgib_aux"]["mu"]
+    logvar = aux["tgib_aux"]["logvar"]
+    kl = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
+    mae = F.l1_loss(preds.view(-1), labels.view(-1))
+
+    loss = mi_term + mae_weight * mae + kl_weight * kl
+    stats = {
+        "mmib_mi": float(mi_term.item()),
+        "mmib_mae": float(mae.item()),
+        "mmib_kl": float(kl.item()),
+        "mmib_loss": float(loss.item()),
+    }
+    return loss, stats
+
+
+def token_regularization_loss(
+    token_weights: torch.Tensor,
+    target_entropy: float = DEFAULT_TOKEN_TARGET_ENTROPY,
+    private_min_weight: float = DEFAULT_PRIVATE_MIN_WEIGHT,
+    shared_target_weight: float = DEFAULT_SHARED_TARGET_WEIGHT,
+    shared_margin: float = DEFAULT_SHARED_DOMINANCE_MARGIN,
+    max_weight: float = DEFAULT_TOKEN_MAX_WEIGHT,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    软先验版 token 正则：
+    - 保留 "shared 主导、text-private 次之" 的总体倾向；
+    - 但不再把分布硬拉回固定模板；
+    - 更强调不过分塌缩、不过分独占，以及 shared/text 的温和排序关系。
+    """
+    eps = 1e-8
+    num_tokens = token_weights.size(1)
+    entropy = -(token_weights * torch.log(token_weights.clamp_min(eps))).sum(dim=1)
+    entropy = entropy / math.log(num_tokens)
+    entropy_penalty = (entropy - target_entropy).pow(2).mean()
+
+    mean_w = token_weights.mean(dim=0)
+    target_prior = torch.tensor([0.34, 0.26, 0.21, 0.19], device=token_weights.device, dtype=token_weights.dtype)
+    balance = F.mse_loss(mean_w, target_prior)
+
+    shared_w = token_weights[:, 0]
+    text_w = token_weights[:, 1]
+    private_w = token_weights[:, 1:]
+    max_private = private_w.max(dim=1).values
+    other_private_max = private_w[:, 1:].max(dim=1).values
+
+    shared_floor_penalty = F.relu(shared_target_weight - shared_w).mean()
+    shared_margin_penalty = F.relu(max_private + shared_margin - shared_w).mean()
+    private_floor_penalty = F.relu(private_min_weight - private_w).mean()
+    text_soft_rank_penalty = F.relu(other_private_max + 0.01 - text_w).mean()
+    peak_penalty = F.relu(token_weights.max(dim=1).values - max_weight).mean()
+
+    loss = (
+        entropy_penalty
+        + 0.18 * balance
+        + 0.80 * shared_floor_penalty
+        + 0.65 * shared_margin_penalty
+        + 0.65 * private_floor_penalty
+        + 0.25 * text_soft_rank_penalty
+        + 0.75 * peak_penalty
+    )
+    stats = {
+        "token_reg_loss": float(loss.item()),
+        "token_entropy": float(entropy.mean().item()),
+        "token_balance": float(balance.item()),
+        "token_max_weight": float(token_weights.max(dim=1).values.mean().item()),
+        "token_floor_penalty": float(private_floor_penalty.item()),
+        "token_peak_penalty": float(peak_penalty.item()),
+        "token_shared_mean": float(shared_w.mean().item()),
+        "token_private_max_mean": float(max_private.mean().item()),
+        "token_dominance_margin": float((shared_w - max_private).mean().item()),
+    }
+    return loss, stats
 
 
 def task_loss_regression(preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -145,39 +446,82 @@ def total_loss(
     alpha: float = 0.05,
     beta: float = 0.05,
     gamma: float = 0.10,
+    delta: float = 0.05,
     sim_margin: float = 0.2,
     moe_balance_weight: float = DEFAULT_MOE_BALANCE_WEIGHT,
+    renyi_alpha: float = DEFAULT_RENYI_ALPHA,
+    renyi_rank_k: int = DEFAULT_RENYI_RANK,
+    mmib_mae_weight: float = 1.0,
+    mmib_kl_weight: float = 1e-4,
+    token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
+    hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
 ):
     l_task = task_loss_regression(preds, labels)
     l_s = similarity_loss(aux, labels, margin=sim_margin)
     l_r = reconstruction_loss(aux)
     l_m = moe_load_loss(aux, balance_weight=moe_balance_weight)
-    total = l_task + alpha * l_s + beta * l_r + gamma * l_m
+    l_mmib, mmib_stats = transformer_guided_ib_loss(
+        preds,
+        labels,
+        aux,
+        alpha=renyi_alpha,
+        rank_k=renyi_rank_k,
+        mae_weight=mmib_mae_weight,
+        kl_weight=mmib_kl_weight,
+    )
+    token_weights = aux["token_fusion_aux"]["token_weights"]
+    l_token_reg, token_stats = token_regularization_loss(token_weights)
+    l_hg, hg_stats = hypergraph_structure_loss(aux)
 
+    total = l_task + alpha * l_s + beta * l_r + gamma * l_m + delta * l_mmib + token_reg_weight * l_token_reg + hypergraph_reg_weight * l_hg
+
+    transformer_attn = aux["tgib_aux"]["transformer_attn"]
+    if transformer_attn.dim() == 4:
+        transformer_attn = transformer_attn.mean(dim=1)
     hyper_aux = aux["hyper_aux"]
-    dwf_aux = aux["dwf_aux"]
-    attn = dwf_aux["attn"]
-    attn_entropy = -(attn * torch.log(attn.clamp_min(1e-8))).sum(dim=-1)
-    attn_entropy = attn_entropy / math.log(attn.size(-1))
+    tgib_aux = aux["tgib_aux"]
 
     stats = {
         "task_loss": float(l_task.item()),
         "sim_loss": float(l_s.item()),
         "recon_loss": float(l_r.item()),
         "moe_loss": float(l_m.item()),
+        "mmib_mi": mmib_stats["mmib_mi"],
+        "mmib_mae": mmib_stats["mmib_mae"],
+        "mmib_kl": mmib_stats["mmib_kl"],
+        "mmib_loss": mmib_stats["mmib_loss"],
+        "hypergraph_reg_loss": hg_stats["hypergraph_reg_loss"],
         "total_loss": float(total.item()),
+        **token_stats,
         "cross_edge_weight_mean": float(hyper_aux["cross_edge_weight_mean"].item()),
         "intra_edge_weight_mean": float(hyper_aux["intra_edge_weight_mean"].item()),
         "cross_edge_weight_std": float(hyper_aux["cross_edge_weight_std"].item()),
         "intra_edge_weight_std": float(hyper_aux["intra_edge_weight_std"].item()),
-        "edge_weight_std": float(hyper_aux["edge_weight_std"].item()),
-        "cross_intra_gap": float(hyper_aux["cross_intra_gap"].item()),
-        "edge_spread": float(hyper_aux["edge_spread"].item()),
+        "edge_weight_std": hg_stats["edge_weight_std"],
+        "cross_intra_gap": hg_stats["cross_intra_gap"],
+        "edge_spread": hg_stats["edge_spread"],
+        "multi_layer_edge_weight_std": hg_stats["multi_layer_edge_weight_std"],
+        "multi_layer_cross_intra_gap": hg_stats["multi_layer_cross_intra_gap"],
+        "multi_layer_edge_spread": hg_stats["multi_layer_edge_spread"],
+        "late_std_preserve_penalty": hg_stats["late_std_preserve_penalty"],
+        "late_spread_preserve_penalty": hg_stats["late_spread_preserve_penalty"],
+        "node_attn_t": float(hyper_aux["node_attn"][:, 0].mean().item()),
+        "node_attn_v": float(hyper_aux["node_attn"][:, 1].mean().item()),
+        "node_attn_a": float(hyper_aux["node_attn"][:, 2].mean().item()),
+        "token_weight_shared": float(token_weights[:, 0].mean().item()),
+        "token_weight_text": float(token_weights[:, 1].mean().item()),
+        "token_weight_vision": float(token_weights[:, 2].mean().item()),
+        "token_weight_audio": float(token_weights[:, 3].mean().item()),
+        "token_dominance_margin": token_stats["token_dominance_margin"],
+        "attn_shared_to_shared": float(transformer_attn[:, 0, 0].mean().item()),
+        "attn_shared_to_text": float(transformer_attn[:, 0, 1].mean().item()),
+        "attn_shared_to_vision": float(transformer_attn[:, 0, 2].mean().item()),
+        "attn_shared_to_audio": float(transformer_attn[:, 0, 3].mean().item()),
         "gate_t_mean": float(aux["tmoe_t_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
         "gate_v_mean": float(aux["tmoe_v_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
         "gate_a_mean": float(aux["tmoe_a_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
-        "dwf_attn_entropy": float(attn_entropy.mean().item()),
-        "dwf_attn_trace": float(attn.diagonal(dim1=-2, dim2=-1).mean().item()),
+        "filtered_std_mean": float(tgib_aux["std"].mean().item()),
+        "filter_shift": float(torch.mean(torch.abs(aux["filtered_repr"] - aux["fused_repr"])).item()),
     }
     return total, stats
 
@@ -190,8 +534,15 @@ def evaluate(
     alpha: float,
     beta: float,
     gamma: float,
+    delta: float,
     sim_margin: float,
     moe_balance_weight: float = DEFAULT_MOE_BALANCE_WEIGHT,
+    renyi_alpha: float = DEFAULT_RENYI_ALPHA,
+    renyi_rank_k: int = DEFAULT_RENYI_RANK,
+    mmib_mae_weight: float = 1.0,
+    mmib_kl_weight: float = 1e-4,
+    token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
+    hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
 ):
     model.eval()
     total_samples = 0
@@ -201,6 +552,17 @@ def evaluate(
         "sim": 0.0,
         "recon": 0.0,
         "moe": 0.0,
+        "mmib": 0.0,
+        "mmib_mi": 0.0,
+        "mmib_mae": 0.0,
+        "mmib_kl": 0.0,
+        "token_reg_loss": 0.0,
+        "hypergraph_reg_loss": 0.0,
+        "token_entropy": 0.0,
+        "token_balance": 0.0,
+        "token_max_weight": 0.0,
+        "token_floor_penalty": 0.0,
+        "token_peak_penalty": 0.0,
         "cross_edge_weight_mean": 0.0,
         "intra_edge_weight_mean": 0.0,
         "cross_edge_weight_std": 0.0,
@@ -208,11 +570,28 @@ def evaluate(
         "edge_weight_std": 0.0,
         "cross_intra_gap": 0.0,
         "edge_spread": 0.0,
+        "multi_layer_edge_weight_std": 0.0,
+        "multi_layer_cross_intra_gap": 0.0,
+        "multi_layer_edge_spread": 0.0,
+        "late_std_preserve_penalty": 0.0,
+        "late_spread_preserve_penalty": 0.0,
+        "node_attn_t": 0.0,
+        "node_attn_v": 0.0,
+        "node_attn_a": 0.0,
+        "token_weight_shared": 0.0,
+        "token_weight_text": 0.0,
+        "token_weight_vision": 0.0,
+        "token_weight_audio": 0.0,
+        "token_dominance_margin": 0.0,
+        "attn_shared_to_shared": 0.0,
+        "attn_shared_to_text": 0.0,
+        "attn_shared_to_vision": 0.0,
+        "attn_shared_to_audio": 0.0,
         "gate_t_mean": 0.0,
         "gate_v_mean": 0.0,
         "gate_a_mean": 0.0,
-        "dwf_attn_entropy": 0.0,
-        "dwf_attn_trace": 0.0,
+        "filtered_std_mean": 0.0,
+        "filter_shift": 0.0,
     }
     all_preds = []
     all_labels = []
@@ -231,8 +610,15 @@ def evaluate(
             alpha=alpha,
             beta=beta,
             gamma=gamma,
+            delta=delta,
             sim_margin=sim_margin,
             moe_balance_weight=moe_balance_weight,
+            renyi_alpha=renyi_alpha,
+            renyi_rank_k=renyi_rank_k,
+            mmib_mae_weight=mmib_mae_weight,
+            mmib_kl_weight=mmib_kl_weight,
+            token_reg_weight=token_reg_weight,
+            hypergraph_reg_weight=hypergraph_reg_weight,
         )
         batch_size = labels.size(0)
         total_samples += batch_size
@@ -242,12 +628,28 @@ def evaluate(
         totals["sim"] += stats["sim_loss"] * batch_size
         totals["recon"] += stats["recon_loss"] * batch_size
         totals["moe"] += stats["moe_loss"] * batch_size
+        totals["mmib"] += stats["mmib_loss"] * batch_size
+        totals["mmib_mi"] += stats["mmib_mi"] * batch_size
+        totals["mmib_mae"] += stats["mmib_mae"] * batch_size
+        totals["mmib_kl"] += stats["mmib_kl"] * batch_size
+        totals["token_reg_loss"] += stats["token_reg_loss"] * batch_size
+        totals["hypergraph_reg_loss"] += stats["hypergraph_reg_loss"] * batch_size
+        totals["token_entropy"] += stats["token_entropy"] * batch_size
+        totals["token_balance"] += stats["token_balance"] * batch_size
+        totals["token_max_weight"] += stats["token_max_weight"] * batch_size
+        totals["token_floor_penalty"] += stats["token_floor_penalty"] * batch_size
+        totals["token_peak_penalty"] += stats["token_peak_penalty"] * batch_size
+
         for key in [
             "cross_edge_weight_mean", "intra_edge_weight_mean",
-            "cross_edge_weight_std", "intra_edge_weight_std", "edge_weight_std",
-            "cross_intra_gap", "edge_spread",
+            "cross_edge_weight_std", "intra_edge_weight_std", "edge_weight_std", "cross_intra_gap", "edge_spread",
+            "multi_layer_edge_weight_std", "multi_layer_cross_intra_gap", "multi_layer_edge_spread",
+            "late_std_preserve_penalty", "late_spread_preserve_penalty",
+            "node_attn_t", "node_attn_v", "node_attn_a",
+            "token_weight_shared", "token_weight_text", "token_weight_vision", "token_weight_audio", "token_dominance_margin",
+            "attn_shared_to_shared", "attn_shared_to_text", "attn_shared_to_vision", "attn_shared_to_audio",
             "gate_t_mean", "gate_v_mean", "gate_a_mean",
-            "dwf_attn_entropy", "dwf_attn_trace",
+            "filtered_std_mean", "filter_shift",
         ]:
             totals[key] += stats[key] * batch_size
 
@@ -266,10 +668,22 @@ def evaluate(
         "sim_loss": totals["sim"] / max(1, total_samples),
         "recon_loss": totals["recon"] / max(1, total_samples),
         "moe_loss": totals["moe"] / max(1, total_samples),
+        "mmib_loss": totals["mmib"] / max(1, total_samples),
+        "mmib_mi": totals["mmib_mi"] / max(1, total_samples),
+        "mmib_mae": totals["mmib_mae"] / max(1, total_samples),
+        "mmib_kl": totals["mmib_kl"] / max(1, total_samples),
+        "token_reg_loss": totals["token_reg_loss"] / max(1, total_samples),
+        "hypergraph_reg_loss": totals["hypergraph_reg_loss"] / max(1, total_samples),
+        "token_entropy": totals["token_entropy"] / max(1, total_samples),
+        "token_balance": totals["token_balance"] / max(1, total_samples),
+        "token_max_weight": totals["token_max_weight"] / max(1, total_samples),
         "analysis": {
             key: value / max(1, total_samples)
             for key, value in totals.items()
-            if key not in {"loss", "task", "sim", "recon", "moe"}
+            if key not in {
+                "loss", "task", "sim", "recon", "moe", "mmib", "mmib_mi", "mmib_mae", "mmib_kl",
+                "token_reg_loss", "hypergraph_reg_loss", "token_entropy", "token_balance", "token_max_weight"
+            }
         },
     }
     return metrics
@@ -283,9 +697,16 @@ def train_one_epoch(
     alpha: float,
     beta: float,
     gamma: float,
+    delta: float,
     sim_margin: float,
     grad_clip: float = 1.0,
     moe_balance_weight: float = DEFAULT_MOE_BALANCE_WEIGHT,
+    renyi_alpha: float = DEFAULT_RENYI_ALPHA,
+    renyi_rank_k: int = DEFAULT_RENYI_RANK,
+    mmib_mae_weight: float = 1.0,
+    mmib_kl_weight: float = 1e-4,
+    token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
+    hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
 ):
     model.train()
     total_samples = 0
@@ -295,6 +716,17 @@ def train_one_epoch(
         "sim": 0.0,
         "recon": 0.0,
         "moe": 0.0,
+        "mmib": 0.0,
+        "mmib_mi": 0.0,
+        "mmib_mae": 0.0,
+        "mmib_kl": 0.0,
+        "token_reg": 0.0,
+        "hypergraph_reg": 0.0,
+        "token_entropy": 0.0,
+        "token_balance": 0.0,
+        "token_max_weight": 0.0,
+        "token_floor_penalty": 0.0,
+        "token_peak_penalty": 0.0,
     }
 
     for batch in dataloader:
@@ -312,8 +744,15 @@ def train_one_epoch(
             alpha=alpha,
             beta=beta,
             gamma=gamma,
+            delta=delta,
             sim_margin=sim_margin,
             moe_balance_weight=moe_balance_weight,
+            renyi_alpha=renyi_alpha,
+            renyi_rank_k=renyi_rank_k,
+            mmib_mae_weight=mmib_mae_weight,
+            mmib_kl_weight=mmib_kl_weight,
+            token_reg_weight=token_reg_weight,
+            hypergraph_reg_weight=hypergraph_reg_weight,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -326,6 +765,17 @@ def train_one_epoch(
         totals["sim"] += stats["sim_loss"] * batch_size
         totals["recon"] += stats["recon_loss"] * batch_size
         totals["moe"] += stats["moe_loss"] * batch_size
+        totals["mmib"] += stats["mmib_loss"] * batch_size
+        totals["mmib_mi"] += stats["mmib_mi"] * batch_size
+        totals["mmib_mae"] += stats["mmib_mae"] * batch_size
+        totals["mmib_kl"] += stats["mmib_kl"] * batch_size
+        totals["token_reg"] += stats["token_reg_loss"] * batch_size
+        totals["hypergraph_reg"] += stats["hypergraph_reg_loss"] * batch_size
+        totals["token_entropy"] += stats["token_entropy"] * batch_size
+        totals["token_balance"] += stats["token_balance"] * batch_size
+        totals["token_max_weight"] += stats["token_max_weight"] * batch_size
+        totals["token_floor_penalty"] += stats["token_floor_penalty"] * batch_size
+        totals["token_peak_penalty"] += stats["token_peak_penalty"] * batch_size
 
     return {
         "train_total_loss": totals["loss"] / max(1, total_samples),
@@ -333,4 +783,15 @@ def train_one_epoch(
         "train_sim_loss": totals["sim"] / max(1, total_samples),
         "train_recon_loss": totals["recon"] / max(1, total_samples),
         "train_moe_loss": totals["moe"] / max(1, total_samples),
+        "train_mmib_loss": totals["mmib"] / max(1, total_samples),
+        "train_mmib_mi": totals["mmib_mi"] / max(1, total_samples),
+        "train_mmib_mae": totals["mmib_mae"] / max(1, total_samples),
+        "train_mmib_kl": totals["mmib_kl"] / max(1, total_samples),
+        "train_token_reg_loss": totals["token_reg"] / max(1, total_samples),
+        "train_hypergraph_reg_loss": totals["hypergraph_reg"] / max(1, total_samples),
+        "train_token_entropy": totals["token_entropy"] / max(1, total_samples),
+        "train_token_balance": totals["token_balance"] / max(1, total_samples),
+        "train_token_max_weight": totals["token_max_weight"] / max(1, total_samples),
+        "train_token_floor_penalty": totals["token_floor_penalty"] / max(1, total_samples),
+        "train_token_peak_penalty": totals["token_peak_penalty"] / max(1, total_samples),
     }
