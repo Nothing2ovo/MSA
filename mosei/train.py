@@ -214,7 +214,7 @@ def main() -> None:
     deterministic = os.environ.get("DET_TRAIN", "0") == "1"
     set_seed(seed, deterministic=deterministic)
 
-    batch_size = 16
+    batch_size = 24
     num_epochs = 50
     learning_rate = 1e-4
     weight_decay = 1e-4
