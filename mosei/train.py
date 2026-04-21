@@ -23,6 +23,7 @@ PLOTS_DIR = os.path.join(BASE_DIR, "plots")
 RESULTS_FILE = os.path.join(BASE_DIR, "results", "final_test_results.txt")
 MODEL_DIR = os.path.join(BASE_DIR, "model file")
 BEST_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhm_mosei_tgib.pt")
+BEST_MAE_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhm_mosei_mae_ref.pt")
 DATA_FILE = os.path.join(BASE_DIR, "data", "aligned_50e.pkl")
 
 
@@ -42,14 +43,58 @@ def set_seed(seed: int = 3407, deterministic: bool = False) -> None:
 
 
 def model_selection_score(metrics: Dict[str, float]) -> float:
-    return (
-        metrics["MAE"]
-        - 0.08 * metrics["Corr"]
-        - 0.03 * metrics["Acc2_posneg"]
-        - 0.03 * metrics["F1_posneg"]
-        - 0.10 * metrics["Acc5"]
-        - 0.08 * metrics["Acc7"]
+    """
+    Plateau score used by LR scheduler.
+    Smaller is better. Strongly classification-oriented, with Acc5 as the
+    primary signal and Acc7 as the secondary signal. MAE/Corr are only mild
+    stabilizers to avoid saving obviously degraded checkpoints.
+    """
+    cls_reward = (
+        1.80 * metrics["Acc5"]
+        + 1.20 * metrics["Acc7"]
+        + 0.35 * metrics["Acc2_posneg"]
+        + 0.20 * metrics["F1_posneg"]
+        + 0.08 * metrics["Corr"]
+        - 0.03 * metrics["MAE"]
     )
+    return -cls_reward
+
+
+def classification_priority_tuple(metrics: Dict[str, float]) -> tuple:
+    """
+    Lexicographic checkpoint priority. Larger tuple is better.
+    Order: Acc5 > Acc7 > Acc2_posneg > F1_posneg > Corr > -MAE
+    """
+    return (
+        round(float(metrics["Acc5"]), 6),
+        round(float(metrics["Acc7"]), 6),
+        round(float(metrics["Acc2_posneg"]), 6),
+        round(float(metrics["F1_posneg"]), 6),
+        round(float(metrics["Corr"]), 6),
+        round(float(-metrics["MAE"]), 6),
+    )
+
+
+def is_better_checkpoint(current: Dict[str, float], best: Dict[str, float] | None) -> bool:
+    """
+    Save checkpoints with a clear classification preference:
+    1) Acc5 improvement >= 0.0020 always wins;
+    2) otherwise Acc7 improvement >= 0.0020 wins if Acc5 is not worse by > 0.0010;
+    3) otherwise compare the full lexicographic priority tuple.
+    This avoids missing later classification peaks because of tiny MAE noise.
+    """
+    if best is None:
+        return True
+
+    acc5_gap = float(current["Acc5"] - best["Acc5"])
+    acc7_gap = float(current["Acc7"] - best["Acc7"])
+
+    if acc5_gap >= 0.0020:
+        return True
+    if acc7_gap >= 0.0020 and acc5_gap >= -0.0010:
+        return True
+
+    return classification_priority_tuple(current) > classification_priority_tuple(best)
 
 
 def compute_ib_weight_schedule(epoch: int, warmup_epochs: int, ramp_epochs: int, max_delta: float) -> float:
@@ -215,7 +260,7 @@ def print_epoch_summary(
     )
     print(f"  selection score = {score:.4f}")
     if improved:
-        print("  status          = improved, best model saved")
+        print("  status          = improved, cls-priority best model saved")
     else:
         print(f"  status          = no improvement, early stop counter {wait}/{patience}")
 
@@ -263,10 +308,10 @@ def main() -> None:
     hg_layers = 3
     intra_k = 3
 
-    print("[Config] cls-focused selection / Acc5+Acc7 ordinal auxiliary / soft-prior-4token / mild TGIB")
+    print("[Config] classification-priority checkpoint / Acc5+Acc7 ordinal auxiliary / soft-prior-4token / mild TGIB")
     print(
         f"[Config] delta={delta:.4f} | mmib_kl={mmib_kl_weight:.6f} | hyper_reg_w={hypergraph_reg_weight:.4f} "
-        f"| cls5_w={acc5_loss_weight:.3f} | cls7_w={acc7_loss_weight:.3f}"
+        f"| cls5_w={acc5_loss_weight:.3f} | cls7_w={acc7_loss_weight:.3f} | ckpt=Acc5>Acc7>Acc2>F1"
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -303,7 +348,8 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-5)
 
     best_score = float("inf")
-    best_mae = float("inf")
+    best_mae_ref = float("inf")
+    best_cls_metrics = None
     wait = 0
 
     history = {
@@ -396,14 +442,25 @@ def main() -> None:
         history["token_entropy"].append(valid_metrics["token_entropy"])
         history["token_max_weight"].append(valid_metrics["token_max_weight"])
 
-        improved = score < best_score - 1e-4
+        improved = is_better_checkpoint(valid_metrics, best_cls_metrics)
         if improved:
+            best_cls_metrics = {
+                "Acc5": float(valid_metrics["Acc5"]),
+                "Acc7": float(valid_metrics["Acc7"]),
+                "Acc2_posneg": float(valid_metrics["Acc2_posneg"]),
+                "F1_posneg": float(valid_metrics["F1_posneg"]),
+                "Corr": float(valid_metrics["Corr"]),
+                "MAE": float(valid_metrics["MAE"]),
+            }
             best_score = score
-            best_mae = valid_metrics["MAE"]
             wait = 0
             torch.save(model.state_dict(), BEST_MODEL_FILE)
         else:
             wait += 1
+
+        if valid_metrics["MAE"] < best_mae_ref - 1e-4:
+            best_mae_ref = float(valid_metrics["MAE"])
+            torch.save(model.state_dict(), BEST_MAE_MODEL_FILE)
 
         print_epoch_summary(
             epoch=epoch,
@@ -431,6 +488,8 @@ def main() -> None:
         mmib_mae_weight=mmib_mae_weight, mmib_kl_weight=mmib_kl_weight,
         token_reg_weight=token_reg_weight,
         hypergraph_reg_weight=hypergraph_reg_weight,
+        acc5_loss_weight=acc5_loss_weight,
+        acc7_loss_weight=acc7_loss_weight,
     )
     final_test = evaluate(
         model, test_loader, device,
@@ -439,6 +498,8 @@ def main() -> None:
         mmib_mae_weight=mmib_mae_weight, mmib_kl_weight=mmib_kl_weight,
         token_reg_weight=token_reg_weight,
         hypergraph_reg_weight=hypergraph_reg_weight,
+        acc5_loss_weight=acc5_loss_weight,
+        acc7_loss_weight=acc7_loss_weight,
     )
 
     print("\n========== Final Validation ==========")
