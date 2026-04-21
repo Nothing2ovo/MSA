@@ -19,6 +19,9 @@ DEFAULT_EDGE_MIN_GAP = 0.013
 DEFAULT_CROSS_EDGE_TARGET_STD = 0.018
 DEFAULT_INTRA_EDGE_TARGET_STD = 0.018
 DEFAULT_EDGE_SPREAD_MARGIN = 0.050
+DEFAULT_ACC5_LOSS_WEIGHT = 0.10
+DEFAULT_ACC7_LOSS_WEIGHT = 0.06
+
 
 
 def compute_mae(preds: torch.Tensor, labels: torch.Tensor) -> float:
@@ -32,6 +35,12 @@ def compute_corr(preds: torch.Tensor, labels: torch.Tensor) -> float:
     y = y - y.mean()
     denom = torch.sqrt((x ** 2).sum()) * torch.sqrt((y ** 2).sum()) + 1e-8
     return ((x * y).sum() / denom).item()
+
+
+def compute_acc5(preds: torch.Tensor, labels: torch.Tensor) -> float:
+    p = torch.clamp(torch.round(preds.view(-1)), min=-2, max=2)
+    y = torch.clamp(torch.round(labels.view(-1)), min=-2, max=2)
+    return (p == y).float().mean().item()
 
 
 def compute_acc7(preds: torch.Tensor, labels: torch.Tensor) -> float:
@@ -439,6 +448,24 @@ def task_loss_regression(preds: torch.Tensor, labels: torch.Tensor) -> torch.Ten
     return F.mse_loss(preds.view(-1), labels.view(-1))
 
 
+def ordinal_threshold_loss(preds: torch.Tensor, labels: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
+    preds = preds.view(-1)
+    labels = labels.view(-1)
+    logits = preds.unsqueeze(1) - thresholds.view(1, -1)
+    targets = (labels.unsqueeze(1) > thresholds.view(1, -1)).float()
+    return F.binary_cross_entropy_with_logits(logits, targets)
+
+
+def classification_aux_losses(preds: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = preds.device
+    dtype = preds.dtype
+    thresholds_5 = torch.tensor([-1.5, -0.5, 0.5, 1.5], device=device, dtype=dtype)
+    thresholds_7 = torch.tensor([-2.5, -1.5, -0.5, 0.5, 1.5, 2.5], device=device, dtype=dtype)
+    loss5 = ordinal_threshold_loss(preds, labels.clamp(min=-2.0, max=2.0), thresholds_5)
+    loss7 = ordinal_threshold_loss(preds, labels.clamp(min=-3.0, max=3.0), thresholds_7)
+    return loss5, loss7
+
+
 def total_loss(
     preds: torch.Tensor,
     labels: torch.Tensor,
@@ -455,6 +482,8 @@ def total_loss(
     mmib_kl_weight: float = 1e-4,
     token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
     hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
+    acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
+    acc7_loss_weight: float = DEFAULT_ACC7_LOSS_WEIGHT,
 ):
     l_task = task_loss_regression(preds, labels)
     l_s = similarity_loss(aux, labels, margin=sim_margin)
@@ -472,8 +501,19 @@ def total_loss(
     token_weights = aux["token_fusion_aux"]["token_weights"]
     l_token_reg, token_stats = token_regularization_loss(token_weights)
     l_hg, hg_stats = hypergraph_structure_loss(aux)
+    l_acc5, l_acc7 = classification_aux_losses(preds, labels)
 
-    total = l_task + alpha * l_s + beta * l_r + gamma * l_m + delta * l_mmib + token_reg_weight * l_token_reg + hypergraph_reg_weight * l_hg
+    total = (
+        l_task
+        + alpha * l_s
+        + beta * l_r
+        + gamma * l_m
+        + delta * l_mmib
+        + token_reg_weight * l_token_reg
+        + hypergraph_reg_weight * l_hg
+        + acc5_loss_weight * l_acc5
+        + acc7_loss_weight * l_acc7
+    )
 
     transformer_attn = aux["tgib_aux"]["transformer_attn"]
     if transformer_attn.dim() == 4:
@@ -491,6 +531,8 @@ def total_loss(
         "mmib_kl": mmib_stats["mmib_kl"],
         "mmib_loss": mmib_stats["mmib_loss"],
         "hypergraph_reg_loss": hg_stats["hypergraph_reg_loss"],
+        "acc5_loss": float(l_acc5.item()),
+        "acc7_loss": float(l_acc7.item()),
         "total_loss": float(total.item()),
         **token_stats,
         "cross_edge_weight_mean": float(hyper_aux["cross_edge_weight_mean"].item()),
@@ -543,6 +585,8 @@ def evaluate(
     mmib_kl_weight: float = 1e-4,
     token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
     hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
+    acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
+    acc7_loss_weight: float = DEFAULT_ACC7_LOSS_WEIGHT,
 ):
     model.eval()
     total_samples = 0
@@ -558,6 +602,8 @@ def evaluate(
         "mmib_kl": 0.0,
         "token_reg_loss": 0.0,
         "hypergraph_reg_loss": 0.0,
+        "acc5_loss": 0.0,
+        "acc7_loss": 0.0,
         "token_entropy": 0.0,
         "token_balance": 0.0,
         "token_max_weight": 0.0,
@@ -619,6 +665,8 @@ def evaluate(
             mmib_kl_weight=mmib_kl_weight,
             token_reg_weight=token_reg_weight,
             hypergraph_reg_weight=hypergraph_reg_weight,
+            acc5_loss_weight=acc5_loss_weight,
+            acc7_loss_weight=acc7_loss_weight,
         )
         batch_size = labels.size(0)
         total_samples += batch_size
@@ -634,6 +682,8 @@ def evaluate(
         totals["mmib_kl"] += stats["mmib_kl"] * batch_size
         totals["token_reg_loss"] += stats["token_reg_loss"] * batch_size
         totals["hypergraph_reg_loss"] += stats["hypergraph_reg_loss"] * batch_size
+        totals["acc5_loss"] += stats["acc5_loss"] * batch_size
+        totals["acc7_loss"] += stats["acc7_loss"] * batch_size
         totals["token_entropy"] += stats["token_entropy"] * batch_size
         totals["token_balance"] += stats["token_balance"] * batch_size
         totals["token_max_weight"] += stats["token_max_weight"] * batch_size
@@ -661,6 +711,7 @@ def evaluate(
     metrics = {
         "MAE": compute_mae(preds, labels),
         "Corr": compute_corr(preds, labels),
+        "Acc5": compute_acc5(preds, labels),
         "Acc7": compute_acc7(preds, labels),
         **compute_acc2_f1(preds, labels),
         "total_loss": totals["loss"] / max(1, total_samples),
@@ -674,6 +725,8 @@ def evaluate(
         "mmib_kl": totals["mmib_kl"] / max(1, total_samples),
         "token_reg_loss": totals["token_reg_loss"] / max(1, total_samples),
         "hypergraph_reg_loss": totals["hypergraph_reg_loss"] / max(1, total_samples),
+        "acc5_loss": totals["acc5_loss"] / max(1, total_samples),
+        "acc7_loss": totals["acc7_loss"] / max(1, total_samples),
         "token_entropy": totals["token_entropy"] / max(1, total_samples),
         "token_balance": totals["token_balance"] / max(1, total_samples),
         "token_max_weight": totals["token_max_weight"] / max(1, total_samples),
@@ -682,7 +735,7 @@ def evaluate(
             for key, value in totals.items()
             if key not in {
                 "loss", "task", "sim", "recon", "moe", "mmib", "mmib_mi", "mmib_mae", "mmib_kl",
-                "token_reg_loss", "hypergraph_reg_loss", "token_entropy", "token_balance", "token_max_weight"
+                "token_reg_loss", "hypergraph_reg_loss", "acc5_loss", "acc7_loss", "token_entropy", "token_balance", "token_max_weight"
             }
         },
     }
@@ -707,6 +760,8 @@ def train_one_epoch(
     mmib_kl_weight: float = 1e-4,
     token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
     hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
+    acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
+    acc7_loss_weight: float = DEFAULT_ACC7_LOSS_WEIGHT,
 ):
     model.train()
     total_samples = 0
@@ -722,6 +777,8 @@ def train_one_epoch(
         "mmib_kl": 0.0,
         "token_reg": 0.0,
         "hypergraph_reg": 0.0,
+        "acc5_loss": 0.0,
+        "acc7_loss": 0.0,
         "token_entropy": 0.0,
         "token_balance": 0.0,
         "token_max_weight": 0.0,
@@ -753,6 +810,8 @@ def train_one_epoch(
             mmib_kl_weight=mmib_kl_weight,
             token_reg_weight=token_reg_weight,
             hypergraph_reg_weight=hypergraph_reg_weight,
+            acc5_loss_weight=acc5_loss_weight,
+            acc7_loss_weight=acc7_loss_weight,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -771,6 +830,8 @@ def train_one_epoch(
         totals["mmib_kl"] += stats["mmib_kl"] * batch_size
         totals["token_reg"] += stats["token_reg_loss"] * batch_size
         totals["hypergraph_reg"] += stats["hypergraph_reg_loss"] * batch_size
+        totals["acc5_loss"] += stats["acc5_loss"] * batch_size
+        totals["acc7_loss"] += stats["acc7_loss"] * batch_size
         totals["token_entropy"] += stats["token_entropy"] * batch_size
         totals["token_balance"] += stats["token_balance"] * batch_size
         totals["token_max_weight"] += stats["token_max_weight"] * batch_size
@@ -789,6 +850,8 @@ def train_one_epoch(
         "train_mmib_kl": totals["mmib_kl"] / max(1, total_samples),
         "train_token_reg_loss": totals["token_reg"] / max(1, total_samples),
         "train_hypergraph_reg_loss": totals["hypergraph_reg"] / max(1, total_samples),
+        "train_acc5_loss": totals["acc5_loss"] / max(1, total_samples),
+        "train_acc7_loss": totals["acc7_loss"] / max(1, total_samples),
         "train_token_entropy": totals["token_entropy"] / max(1, total_samples),
         "train_token_balance": totals["token_balance"] / max(1, total_samples),
         "train_token_max_weight": totals["token_max_weight"] / max(1, total_samples),

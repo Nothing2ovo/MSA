@@ -42,7 +42,14 @@ def set_seed(seed: int = 3407, deterministic: bool = False) -> None:
 
 
 def model_selection_score(metrics: Dict[str, float]) -> float:
-    return metrics["MAE"] - 0.10 * metrics["Corr"] - 0.01 * metrics["Acc2_posneg"]
+    return (
+        metrics["MAE"]
+        - 0.08 * metrics["Corr"]
+        - 0.03 * metrics["Acc2_posneg"]
+        - 0.03 * metrics["F1_posneg"]
+        - 0.10 * metrics["Acc5"]
+        - 0.08 * metrics["Acc7"]
+    )
 
 
 def compute_ib_weight_schedule(epoch: int, warmup_epochs: int, ramp_epochs: int, max_delta: float) -> float:
@@ -84,6 +91,7 @@ def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) ->
 
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, history["valid_acc2_posneg"], label="valid Acc2 pos/neg")
+    plt.plot(epochs, history["valid_acc5"], label="valid Acc5")
     plt.plot(epochs, history["valid_acc7"], label="valid Acc7")
     plt.plot(epochs, history["valid_f1_posneg"], label="valid F1 pos/neg")
     plt.xlabel("Epoch")
@@ -133,10 +141,12 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
         f"  hyper reg    : {metrics['hypergraph_reg_loss']:.4f}",
         f"  token entropy: {metrics['token_entropy']:.4f}",
         f"  token maxw   : {metrics['token_max_weight']:.4f}",
+        f"  cls5/cls7    : {metrics['acc5_loss']:.4f} / {metrics['acc7_loss']:.4f}",
         f"Test MAE       : {metrics['MAE']:.4f}",
         f"Test Corr      : {metrics['Corr']:.4f}",
         f"Test Acc2      : {metrics['Acc2_nonneg']:.4f} / {metrics['Acc2_posneg']:.4f}",
         f"Test F1        : {metrics['F1_nonneg']:.4f} / {metrics['F1_posneg']:.4f}",
+        f"Test Acc5      : {metrics['Acc5']:.4f}",
         f"Test Acc7      : {metrics['Acc7']:.4f}",
         "Analysis:",
         f"  cross edge mean     : {analysis['cross_edge_weight_mean']:.4f}",
@@ -175,12 +185,14 @@ def print_epoch_summary(
         f"  train total/task= {train_stats['train_total_loss']:.4f} / {train_stats['train_task_loss']:.4f} | "
         f"sim={train_stats['train_sim_loss']:.4f} recon={train_stats['train_recon_loss']:.4f} "
         f"moe={train_stats['train_moe_loss']:.4f} token_reg={train_stats['train_token_reg_loss']:.4f} "
-        f"hyper_reg={train_stats['train_hypergraph_reg_loss']:.4f} tgib={train_stats['train_mmib_loss']:.4f}"
+        f"hyper_reg={train_stats['train_hypergraph_reg_loss']:.4f} tgib={train_stats['train_mmib_loss']:.4f} "
+        f"cls5={train_stats['train_acc5_loss']:.4f} cls7={train_stats['train_acc7_loss']:.4f}"
     )
     print(
         f"  valid MAE/Corr  = {valid_metrics['MAE']:.4f} / {valid_metrics['Corr']:.4f} | "
         f"Acc2={valid_metrics['Acc2_nonneg']:.4f}/{valid_metrics['Acc2_posneg']:.4f} | "
-        f"F1={valid_metrics['F1_nonneg']:.4f}/{valid_metrics['F1_posneg']:.4f} | Acc7={valid_metrics['Acc7']:.4f}"
+        f"F1={valid_metrics['F1_nonneg']:.4f}/{valid_metrics['F1_posneg']:.4f} | "
+        f"Acc5={valid_metrics['Acc5']:.4f} | Acc7={valid_metrics['Acc7']:.4f}"
     )
     print(
         f"  valid losses    = total {valid_metrics['total_loss']:.4f} | task {valid_metrics['task_loss']:.4f} | "
@@ -233,6 +245,8 @@ def main() -> None:
     mmib_kl_weight = 7.5e-5
     token_reg_weight = 0.04
     hypergraph_reg_weight = 0.055
+    acc5_loss_weight = 0.10
+    acc7_loss_weight = 0.06
 
     ib_warmup_epochs = 6
     ib_ramp_epochs = 8
@@ -249,8 +263,11 @@ def main() -> None:
     hg_layers = 3
     intra_k = 3
 
-    print("[Config] restored-hypergraph / soft-prior-4token / mildly-raised-TGIB")
-    print(f"[Config] delta={delta:.4f} | mmib_kl={mmib_kl_weight:.6f} | hyper_reg_w={hypergraph_reg_weight:.4f}")
+    print("[Config] cls-focused selection / Acc5+Acc7 ordinal auxiliary / soft-prior-4token / mild TGIB")
+    print(
+        f"[Config] delta={delta:.4f} | mmib_kl={mmib_kl_weight:.6f} | hyper_reg_w={hypergraph_reg_weight:.4f} "
+        f"| cls5_w={acc5_loss_weight:.3f} | cls7_w={acc7_loss_weight:.3f}"
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"seed: {seed} | deterministic: {deterministic}")
@@ -299,6 +316,7 @@ def main() -> None:
         "valid_filter_shift": [],
         "valid_acc2_posneg": [],
         "valid_f1_posneg": [],
+        "valid_acc5": [],
         "valid_acc7": [],
         "cross_edge_weight_mean": [],
         "intra_edge_weight_mean": [],
@@ -332,6 +350,8 @@ def main() -> None:
             mmib_kl_weight=mmib_kl_weight,
             token_reg_weight=token_reg_weight,
             hypergraph_reg_weight=hypergraph_reg_weight,
+            acc5_loss_weight=acc5_loss_weight,
+            acc7_loss_weight=acc7_loss_weight,
         )
         valid_metrics = evaluate(
             model,
@@ -348,9 +368,11 @@ def main() -> None:
             mmib_kl_weight=mmib_kl_weight,
             token_reg_weight=token_reg_weight,
             hypergraph_reg_weight=hypergraph_reg_weight,
+            acc5_loss_weight=acc5_loss_weight,
+            acc7_loss_weight=acc7_loss_weight,
         )
         score = model_selection_score(valid_metrics)
-        scheduler.step(valid_metrics["MAE"])
+        scheduler.step(score)
 
         history["train_total_loss"].append(train_stats["train_total_loss"])
         history["valid_total_loss"].append(valid_metrics["total_loss"])
@@ -361,6 +383,7 @@ def main() -> None:
         history["valid_filter_shift"].append(valid_metrics["analysis"]["filter_shift"])
         history["valid_acc2_posneg"].append(valid_metrics["Acc2_posneg"])
         history["valid_f1_posneg"].append(valid_metrics["F1_posneg"])
+        history["valid_acc5"].append(valid_metrics["Acc5"])
         history["valid_acc7"].append(valid_metrics["Acc7"])
         history["cross_edge_weight_mean"].append(valid_metrics["analysis"]["cross_edge_weight_mean"])
         history["intra_edge_weight_mean"].append(valid_metrics["analysis"]["intra_edge_weight_mean"])
@@ -373,7 +396,7 @@ def main() -> None:
         history["token_entropy"].append(valid_metrics["token_entropy"])
         history["token_max_weight"].append(valid_metrics["token_max_weight"])
 
-        improved = score < best_score - 1e-4 or valid_metrics["MAE"] < best_mae - 1e-4
+        improved = score < best_score - 1e-4
         if improved:
             best_score = score
             best_mae = valid_metrics["MAE"]
@@ -419,11 +442,11 @@ def main() -> None:
     )
 
     print("\n========== Final Validation ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc7", "total_loss", "mmib_loss", "token_reg_loss", "hypergraph_reg_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "mmib_loss", "token_reg_loss", "hypergraph_reg_loss", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_valid[k]:.4f}")
 
     print("\n========== Final Test ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc7", "total_loss", "mmib_loss", "token_reg_loss", "hypergraph_reg_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "mmib_loss", "token_reg_loss", "hypergraph_reg_loss", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_test[k]:.4f}")
 
     save_final_test_results(RESULTS_FILE, final_test)
