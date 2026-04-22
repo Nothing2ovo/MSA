@@ -5,8 +5,6 @@ import torch
 import torch.nn.functional as F
 
 DEFAULT_MOE_BALANCE_WEIGHT = 1e-2
-DEFAULT_RENYI_ALPHA = 1.9
-DEFAULT_RENYI_RANK = 10
 DEFAULT_TOKEN_REG_WEIGHT = 2e-2
 DEFAULT_HYPERGRAPH_REG_WEIGHT = 5.5e-2
 DEFAULT_TOKEN_TARGET_ENTROPY = 0.87
@@ -21,7 +19,8 @@ DEFAULT_INTRA_EDGE_TARGET_STD = 0.018
 DEFAULT_EDGE_SPREAD_MARGIN = 0.050
 DEFAULT_ACC5_LOSS_WEIGHT = 0.10
 DEFAULT_ACC7_LOSS_WEIGHT = 0.06
-
+DEFAULT_SUPCON_TEMPERATURE = 0.20
+DEFAULT_UNSUPCON_TEMPERATURE = 0.20
 
 
 def compute_mae(preds: torch.Tensor, labels: torch.Tensor) -> float:
@@ -155,6 +154,54 @@ def moe_load_loss(aux: Dict[str, torch.Tensor], balance_weight: float = DEFAULT_
     return sum(losses) / len(losses)
 
 
+def supervised_hypergraph_contrastive_loss(
+    aux: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    temperature: float = DEFAULT_SUPCON_TEMPERATURE,
+) -> torch.Tensor:
+    z = F.normalize(aux["shared_proj"], dim=-1)
+    cls = labels_to_classes(labels)
+    batch_size = z.size(0)
+    if batch_size <= 1:
+        return torch.zeros((), device=z.device, dtype=z.dtype)
+
+    sim = torch.matmul(z, z.t()) / max(temperature, 1e-6)
+    logits_mask = ~torch.eye(batch_size, device=z.device, dtype=torch.bool)
+    sim = sim.masked_fill(~logits_mask, -1e9)
+
+    positive_mask = (cls.unsqueeze(1) == cls.unsqueeze(0)) & logits_mask
+    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+
+    positive_count = positive_mask.sum(dim=1)
+    valid = positive_count > 0
+    if valid.sum() == 0:
+        return torch.zeros((), device=z.device, dtype=z.dtype)
+
+    loss = -(positive_mask.float() * log_prob).sum(dim=1) / positive_count.clamp_min(1).float()
+    return loss[valid].mean()
+
+
+def unsupervised_hypergraph_contrastive_loss(
+    aux: Dict[str, torch.Tensor],
+    temperature: float = DEFAULT_UNSUPCON_TEMPERATURE,
+) -> torch.Tensor:
+    z1 = F.normalize(aux["shared_proj"], dim=-1)
+    z2 = F.normalize(aux["shared_proj_aug"], dim=-1)
+    batch_size = z1.size(0)
+    if batch_size <= 1:
+        return 1.0 - F.cosine_similarity(z1, z2, dim=-1).mean()
+
+    z = torch.cat([z1, z2], dim=0)
+    sim = torch.matmul(z, z.t()) / max(temperature, 1e-6)
+    logits_mask = ~torch.eye(2 * batch_size, device=z.device, dtype=torch.bool)
+    sim = sim.masked_fill(~logits_mask, -1e9)
+
+    pos_idx = torch.arange(2 * batch_size, device=z.device)
+    pos_idx = (pos_idx + batch_size) % (2 * batch_size)
+    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    loss = -log_prob[torch.arange(2 * batch_size, device=z.device), pos_idx]
+    return loss.mean()
+
 
 def hypergraph_structure_loss(
     aux: Dict[str, torch.Tensor],
@@ -164,49 +211,13 @@ def hypergraph_structure_loss(
     target_intra_std: float = DEFAULT_INTRA_EDGE_TARGET_STD,
     min_edge_spread: float = DEFAULT_EDGE_SPREAD_MARGIN,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    多层防塌缩超图正则：
-    1) 不再只约束最后一层，而是所有 hypergraph layers 一起约束；
-    2) 重点放在 edge std / edge spread，gap 只作为次级约束；
-    3) 增加后层保形约束，减少“前层有差异、后层又抹平”的二次回缩。
-    """
     hyper_aux = aux["hyper_aux"]
 
-    if "per_layer_edge_weight_std" in hyper_aux:
-        per_layer_edge_std = hyper_aux["per_layer_edge_weight_std"]
-        per_layer_cross_std = hyper_aux["per_layer_cross_edge_weight_std"]
-        per_layer_intra_std = hyper_aux["per_layer_intra_edge_weight_std"]
-        per_layer_gap = hyper_aux["per_layer_cross_intra_gap"].abs()
-        per_layer_spread = hyper_aux["per_layer_edge_spread"]
-    else:
-        num_cross = int(hyper_aux["cross_edges"].item())
-        edge_stds = []
-        cross_stds = []
-        intra_stds = []
-        gaps = []
-        spreads = []
-        zero = None
-        for edge_w in hyper_aux["edge_weights_per_layer"]:
-            if zero is None:
-                zero = torch.zeros((), device=edge_w.device, dtype=edge_w.dtype)
-            cross_w = edge_w[:num_cross]
-            intra_w = edge_w[num_cross:]
-            edge_stds.append(edge_w.std(unbiased=False) if edge_w.numel() > 1 else zero)
-            cross_stds.append(cross_w.std(unbiased=False) if cross_w.numel() > 1 else zero)
-            intra_stds.append(intra_w.std(unbiased=False) if intra_w.numel() > 1 else zero)
-            gaps.append(torch.abs(cross_w.mean() - intra_w.mean()) if cross_w.numel() > 0 and intra_w.numel() > 0 else zero)
-            if edge_w.numel() >= 4:
-                k = max(1, edge_w.numel() // 10)
-                top_mean = torch.topk(edge_w, k=k).values.mean()
-                bottom_mean = torch.topk(edge_w, k=k, largest=False).values.mean()
-                spreads.append(top_mean - bottom_mean)
-            else:
-                spreads.append(zero)
-        per_layer_edge_std = torch.stack(edge_stds)
-        per_layer_cross_std = torch.stack(cross_stds)
-        per_layer_intra_std = torch.stack(intra_stds)
-        per_layer_gap = torch.stack(gaps)
-        per_layer_spread = torch.stack(spreads)
+    per_layer_edge_std = hyper_aux["per_layer_edge_weight_std"]
+    per_layer_cross_std = hyper_aux["per_layer_cross_edge_weight_std"]
+    per_layer_intra_std = hyper_aux["per_layer_intra_edge_weight_std"]
+    per_layer_gap = hyper_aux["per_layer_cross_intra_gap"].abs()
+    per_layer_spread = hyper_aux["per_layer_edge_spread"]
 
     num_layers = int(per_layer_edge_std.numel())
     layer_weights = torch.linspace(
@@ -228,7 +239,6 @@ def hypergraph_structure_loss(
     spread_pen = weighted_mean(F.relu(min_edge_spread - per_layer_spread))
 
     if num_layers > 1:
-        # 后层不要比前层塌得太快；允许下降，但不允许急剧回缩
         next_edge_std = per_layer_edge_std[1:]
         prev_edge_std = per_layer_edge_std[:-1]
         next_spread = per_layer_spread[1:]
@@ -251,13 +261,11 @@ def hypergraph_structure_loss(
 
     stats = {
         "hypergraph_reg_loss": float(loss.item()),
-        # backward-compatible keys use multi-layer means now
         "edge_weight_std": float(per_layer_edge_std.mean().item()),
         "cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
         "intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
         "cross_intra_gap": float(per_layer_gap.mean().item()),
         "edge_spread": float(per_layer_spread.mean().item()),
-        # extra diagnostics
         "multi_layer_edge_weight_std": float(per_layer_edge_std.mean().item()),
         "multi_layer_cross_edge_weight_std": float(per_layer_cross_std.mean().item()),
         "multi_layer_intra_edge_weight_std": float(per_layer_intra_std.mean().item()),
@@ -265,122 +273,6 @@ def hypergraph_structure_loss(
         "multi_layer_edge_spread": float(per_layer_spread.mean().item()),
         "late_std_preserve_penalty": float(late_std_preserve_pen.item()),
         "late_spread_preserve_penalty": float(late_spread_preserve_pen.item()),
-    }
-    return loss, stats
-
-
-def pairwise_sq_dist(x: torch.Tensor) -> torch.Tensor:
-    if x.dim() > 2:
-        x = x.reshape(x.size(0), -1)
-    x = torch.nan_to_num(x.float(), nan=0.0, posinf=1e4, neginf=-1e4).contiguous()
-    dist = torch.cdist(x, x, p=2)
-    return dist.pow(2)
-
-
-def _estimate_sigma2_from_batch(dist2: torch.Tensor) -> torch.Tensor:
-    n = dist2.size(0)
-    if n <= 1:
-        return torch.tensor(1.0, device=dist2.device, dtype=dist2.dtype)
-    dist = torch.sqrt(dist2.clamp_min(1e-12))
-    masked = dist + torch.eye(n, device=dist.device, dtype=dist.dtype) * 1e9
-    k = min(5, n - 1)
-    knn = torch.topk(masked, k=k, largest=False, dim=-1).values
-    sigma = torch.nan_to_num(knn.mean(), nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1e-4)
-    return sigma.pow(2)
-
-
-def normalized_gaussian_gram(x: torch.Tensor, sigma2: torch.Tensor = None) -> torch.Tensor:
-    if x.dim() > 2:
-        x = x.reshape(x.size(0), -1)
-    n = x.size(0)
-    if n == 1:
-        return torch.ones(1, 1, device=x.device, dtype=torch.float32)
-
-    x = torch.nan_to_num(x.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-    dist2 = pairwise_sq_dist(x)
-    if sigma2 is None:
-        sigma2 = _estimate_sigma2_from_batch(dist2)
-
-    gram = torch.exp(-(dist2 / (sigma2 + 1e-8)).clamp(max=50.0))
-    gram = torch.nan_to_num(gram, nan=0.0, posinf=1.0, neginf=0.0)
-    gram = 0.5 * (gram + gram.t())
-    gram = gram + 1e-6 * torch.eye(n, device=gram.device, dtype=gram.dtype)
-    gram = gram / torch.trace(gram).clamp_min(1e-8)
-    gram = 0.5 * (gram + gram.t())
-    return gram
-
-
-def low_rank_renyi_entropy(gram: torch.Tensor, alpha: float = DEFAULT_RENYI_ALPHA, rank_k: int = DEFAULT_RENYI_RANK) -> torch.Tensor:
-    n = gram.size(0)
-    if n <= 1:
-        return torch.zeros((), device=gram.device, dtype=gram.dtype)
-
-    gram_safe = torch.nan_to_num(gram.float(), nan=0.0, posinf=1.0, neginf=0.0)
-    gram_safe = 0.5 * (gram_safe + gram_safe.t())
-    gram_safe = gram_safe + 1e-6 * torch.eye(n, device=gram_safe.device, dtype=gram_safe.dtype)
-    gram_safe = gram_safe / torch.trace(gram_safe).clamp_min(1e-8)
-
-    evals = torch.linalg.eigvalsh(gram_safe.to(device="cpu", dtype=torch.float64))
-    evals = torch.flip(evals, dims=[0]).clamp_min(1e-12)
-    evals = evals.to(device=gram.device, dtype=gram.dtype)
-
-    if rank_k >= n:
-        val = torch.sum(evals.pow(alpha))
-        return torch.log2(val.clamp_min(1e-12)) / (1.0 - alpha)
-
-    top = evals[:rank_k]
-    remain_mass = (1.0 - top.sum()).clamp_min(1e-12)
-    lambda_r = remain_mass / max(1, n - rank_k)
-    val = top.pow(alpha).sum() + max(1, n - rank_k) * lambda_r.pow(alpha)
-    return torch.log2(val.clamp_min(1e-12)) / (1.0 - alpha)
-
-
-def low_rank_renyi_mutual_information(
-    x: torch.Tensor,
-    z: torch.Tensor,
-    alpha: float = DEFAULT_RENYI_ALPHA,
-    rank_k: int = DEFAULT_RENYI_RANK,
-) -> torch.Tensor:
-    if x.size(0) <= 1:
-        return torch.zeros((), device=x.device, dtype=x.dtype)
-
-    a = normalized_gaussian_gram(x)
-    b = normalized_gaussian_gram(z)
-    joint = a * b
-    joint = joint / torch.trace(joint).clamp_min(1e-8)
-    joint = 0.5 * (joint + joint.t())
-
-    h_a = low_rank_renyi_entropy(a, alpha=alpha, rank_k=rank_k)
-    h_b = low_rank_renyi_entropy(b, alpha=alpha, rank_k=rank_k)
-    h_joint = low_rank_renyi_entropy(joint, alpha=alpha, rank_k=rank_k)
-    mi = h_a + h_b - h_joint
-    return mi.clamp_min(0.0)
-
-
-def transformer_guided_ib_loss(
-    preds: torch.Tensor,
-    labels: torch.Tensor,
-    aux: Dict[str, torch.Tensor],
-    alpha: float = DEFAULT_RENYI_ALPHA,
-    rank_k: int = DEFAULT_RENYI_RANK,
-    mae_weight: float = 1.0,
-    kl_weight: float = 1e-4,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    pre_ib = aux["fused_repr"]
-    z = aux["filtered_repr"]
-    mi_term = low_rank_renyi_mutual_information(pre_ib, z, alpha=alpha, rank_k=rank_k)
-
-    mu = aux["tgib_aux"]["mu"]
-    logvar = aux["tgib_aux"]["logvar"]
-    kl = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
-    mae = F.l1_loss(preds.view(-1), labels.view(-1))
-
-    loss = mi_term + mae_weight * mae + kl_weight * kl
-    stats = {
-        "mmib_mi": float(mi_term.item()),
-        "mmib_mae": float(mae.item()),
-        "mmib_kl": float(kl.item()),
-        "mmib_loss": float(loss.item()),
     }
     return loss, stats
 
@@ -393,12 +285,6 @@ def token_regularization_loss(
     shared_margin: float = DEFAULT_SHARED_DOMINANCE_MARGIN,
     max_weight: float = DEFAULT_TOKEN_MAX_WEIGHT,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    软先验版 token 正则：
-    - 保留 "shared 主导、text-private 次之" 的总体倾向；
-    - 但不再把分布硬拉回固定模板；
-    - 更强调不过分塌缩、不过分独占，以及 shared/text 的温和排序关系。
-    """
     eps = 1e-8
     num_tokens = token_weights.size(1)
     entropy = -(token_weights * torch.log(token_weights.clamp_min(eps))).sum(dim=1)
@@ -470,16 +356,13 @@ def total_loss(
     preds: torch.Tensor,
     labels: torch.Tensor,
     aux: Dict[str, torch.Tensor],
-    alpha: float = 0.05,
-    beta: float = 0.05,
-    gamma: float = 0.10,
-    delta: float = 0.05,
+    sim_weight: float = 0.05,
+    recon_weight: float = 0.05,
+    moe_weight: float = 0.10,
+    supcon_weight: float = 0.05,
+    unsupcon_weight: float = 0.05,
     sim_margin: float = 0.2,
     moe_balance_weight: float = DEFAULT_MOE_BALANCE_WEIGHT,
-    renyi_alpha: float = DEFAULT_RENYI_ALPHA,
-    renyi_rank_k: int = DEFAULT_RENYI_RANK,
-    mmib_mae_weight: float = 1.0,
-    mmib_kl_weight: float = 1e-4,
     token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
     hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
     acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
@@ -489,15 +372,8 @@ def total_loss(
     l_s = similarity_loss(aux, labels, margin=sim_margin)
     l_r = reconstruction_loss(aux)
     l_m = moe_load_loss(aux, balance_weight=moe_balance_weight)
-    l_mmib, mmib_stats = transformer_guided_ib_loss(
-        preds,
-        labels,
-        aux,
-        alpha=renyi_alpha,
-        rank_k=renyi_rank_k,
-        mae_weight=mmib_mae_weight,
-        kl_weight=mmib_kl_weight,
-    )
+    l_sup = supervised_hypergraph_contrastive_loss(aux, labels)
+    l_unsup = unsupervised_hypergraph_contrastive_loss(aux)
     token_weights = aux["token_fusion_aux"]["token_weights"]
     l_token_reg, token_stats = token_regularization_loss(token_weights)
     l_hg, hg_stats = hypergraph_structure_loss(aux)
@@ -505,31 +381,29 @@ def total_loss(
 
     total = (
         l_task
-        + alpha * l_s
-        + beta * l_r
-        + gamma * l_m
-        + delta * l_mmib
+        + sim_weight * l_s
+        + recon_weight * l_r
+        + moe_weight * l_m
+        + supcon_weight * l_sup
+        + unsupcon_weight * l_unsup
         + token_reg_weight * l_token_reg
         + hypergraph_reg_weight * l_hg
         + acc5_loss_weight * l_acc5
         + acc7_loss_weight * l_acc7
     )
 
-    transformer_attn = aux["tgib_aux"]["transformer_attn"]
-    if transformer_attn.dim() == 4:
-        transformer_attn = transformer_attn.mean(dim=1)
+    fusion_attn = aux["fusion_attn"]
+    if fusion_attn.dim() == 4:
+        fusion_attn = fusion_attn.mean(dim=1)
     hyper_aux = aux["hyper_aux"]
-    tgib_aux = aux["tgib_aux"]
 
     stats = {
         "task_loss": float(l_task.item()),
         "sim_loss": float(l_s.item()),
         "recon_loss": float(l_r.item()),
         "moe_loss": float(l_m.item()),
-        "mmib_mi": mmib_stats["mmib_mi"],
-        "mmib_mae": mmib_stats["mmib_mae"],
-        "mmib_kl": mmib_stats["mmib_kl"],
-        "mmib_loss": mmib_stats["mmib_loss"],
+        "supcon_loss": float(l_sup.item()),
+        "unsupcon_loss": float(l_unsup.item()),
         "hypergraph_reg_loss": hg_stats["hypergraph_reg_loss"],
         "acc5_loss": float(l_acc5.item()),
         "acc7_loss": float(l_acc7.item()),
@@ -555,15 +429,15 @@ def total_loss(
         "token_weight_vision": float(token_weights[:, 2].mean().item()),
         "token_weight_audio": float(token_weights[:, 3].mean().item()),
         "token_dominance_margin": token_stats["token_dominance_margin"],
-        "attn_shared_to_shared": float(transformer_attn[:, 0, 0].mean().item()),
-        "attn_shared_to_text": float(transformer_attn[:, 0, 1].mean().item()),
-        "attn_shared_to_vision": float(transformer_attn[:, 0, 2].mean().item()),
-        "attn_shared_to_audio": float(transformer_attn[:, 0, 3].mean().item()),
+        "attn_shared_to_shared": float(fusion_attn[:, 0, 0].mean().item()),
+        "attn_shared_to_text": float(fusion_attn[:, 0, 1].mean().item()),
+        "attn_shared_to_vision": float(fusion_attn[:, 0, 2].mean().item()),
+        "attn_shared_to_audio": float(fusion_attn[:, 0, 3].mean().item()),
         "gate_t_mean": float(aux["tmoe_t_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
         "gate_v_mean": float(aux["tmoe_v_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
         "gate_a_mean": float(aux["tmoe_a_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
-        "filtered_std_mean": float(tgib_aux["std"].mean().item()),
-        "filter_shift": float(torch.mean(torch.abs(aux["filtered_repr"] - aux["fused_repr"])).item()),
+        "shared_view_gap": float(torch.mean(torch.abs(aux["hyper_repr"] - aux["hyper_repr_aug"])).item()),
+        "fused_repr_norm": float(aux["fused_repr"].norm(dim=-1).mean().item()),
     }
     return total, stats
 
@@ -573,16 +447,13 @@ def evaluate(
     model,
     dataloader,
     device,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    delta: float,
+    sim_weight: float,
+    recon_weight: float,
+    moe_weight: float,
+    supcon_weight: float,
+    unsupcon_weight: float,
     sim_margin: float,
     moe_balance_weight: float = DEFAULT_MOE_BALANCE_WEIGHT,
-    renyi_alpha: float = DEFAULT_RENYI_ALPHA,
-    renyi_rank_k: int = DEFAULT_RENYI_RANK,
-    mmib_mae_weight: float = 1.0,
-    mmib_kl_weight: float = 1e-4,
     token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
     hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
     acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
@@ -596,10 +467,8 @@ def evaluate(
         "sim": 0.0,
         "recon": 0.0,
         "moe": 0.0,
-        "mmib": 0.0,
-        "mmib_mi": 0.0,
-        "mmib_mae": 0.0,
-        "mmib_kl": 0.0,
+        "supcon": 0.0,
+        "unsupcon": 0.0,
         "token_reg_loss": 0.0,
         "hypergraph_reg_loss": 0.0,
         "acc5_loss": 0.0,
@@ -636,8 +505,8 @@ def evaluate(
         "gate_t_mean": 0.0,
         "gate_v_mean": 0.0,
         "gate_a_mean": 0.0,
-        "filtered_std_mean": 0.0,
-        "filter_shift": 0.0,
+        "shared_view_gap": 0.0,
+        "fused_repr_norm": 0.0,
     }
     all_preds = []
     all_labels = []
@@ -653,16 +522,13 @@ def evaluate(
             preds,
             labels,
             aux,
-            alpha=alpha,
-            beta=beta,
-            gamma=gamma,
-            delta=delta,
+            sim_weight=sim_weight,
+            recon_weight=recon_weight,
+            moe_weight=moe_weight,
+            supcon_weight=supcon_weight,
+            unsupcon_weight=unsupcon_weight,
             sim_margin=sim_margin,
             moe_balance_weight=moe_balance_weight,
-            renyi_alpha=renyi_alpha,
-            renyi_rank_k=renyi_rank_k,
-            mmib_mae_weight=mmib_mae_weight,
-            mmib_kl_weight=mmib_kl_weight,
             token_reg_weight=token_reg_weight,
             hypergraph_reg_weight=hypergraph_reg_weight,
             acc5_loss_weight=acc5_loss_weight,
@@ -676,10 +542,8 @@ def evaluate(
         totals["sim"] += stats["sim_loss"] * batch_size
         totals["recon"] += stats["recon_loss"] * batch_size
         totals["moe"] += stats["moe_loss"] * batch_size
-        totals["mmib"] += stats["mmib_loss"] * batch_size
-        totals["mmib_mi"] += stats["mmib_mi"] * batch_size
-        totals["mmib_mae"] += stats["mmib_mae"] * batch_size
-        totals["mmib_kl"] += stats["mmib_kl"] * batch_size
+        totals["supcon"] += stats["supcon_loss"] * batch_size
+        totals["unsupcon"] += stats["unsupcon_loss"] * batch_size
         totals["token_reg_loss"] += stats["token_reg_loss"] * batch_size
         totals["hypergraph_reg_loss"] += stats["hypergraph_reg_loss"] * batch_size
         totals["acc5_loss"] += stats["acc5_loss"] * batch_size
@@ -699,7 +563,7 @@ def evaluate(
             "token_weight_shared", "token_weight_text", "token_weight_vision", "token_weight_audio", "token_dominance_margin",
             "attn_shared_to_shared", "attn_shared_to_text", "attn_shared_to_vision", "attn_shared_to_audio",
             "gate_t_mean", "gate_v_mean", "gate_a_mean",
-            "filtered_std_mean", "filter_shift",
+            "shared_view_gap", "fused_repr_norm",
         ]:
             totals[key] += stats[key] * batch_size
 
@@ -719,10 +583,8 @@ def evaluate(
         "sim_loss": totals["sim"] / max(1, total_samples),
         "recon_loss": totals["recon"] / max(1, total_samples),
         "moe_loss": totals["moe"] / max(1, total_samples),
-        "mmib_loss": totals["mmib"] / max(1, total_samples),
-        "mmib_mi": totals["mmib_mi"] / max(1, total_samples),
-        "mmib_mae": totals["mmib_mae"] / max(1, total_samples),
-        "mmib_kl": totals["mmib_kl"] / max(1, total_samples),
+        "supcon_loss": totals["supcon"] / max(1, total_samples),
+        "unsupcon_loss": totals["unsupcon"] / max(1, total_samples),
         "token_reg_loss": totals["token_reg_loss"] / max(1, total_samples),
         "hypergraph_reg_loss": totals["hypergraph_reg_loss"] / max(1, total_samples),
         "acc5_loss": totals["acc5_loss"] / max(1, total_samples),
@@ -734,7 +596,7 @@ def evaluate(
             key: value / max(1, total_samples)
             for key, value in totals.items()
             if key not in {
-                "loss", "task", "sim", "recon", "moe", "mmib", "mmib_mi", "mmib_mae", "mmib_kl",
+                "loss", "task", "sim", "recon", "moe", "supcon", "unsupcon",
                 "token_reg_loss", "hypergraph_reg_loss", "acc5_loss", "acc7_loss", "token_entropy", "token_balance", "token_max_weight"
             }
         },
@@ -747,17 +609,14 @@ def train_one_epoch(
     dataloader,
     optimizer,
     device,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    delta: float,
+    sim_weight: float,
+    recon_weight: float,
+    moe_weight: float,
+    supcon_weight: float,
+    unsupcon_weight: float,
     sim_margin: float,
     grad_clip: float = 1.0,
     moe_balance_weight: float = DEFAULT_MOE_BALANCE_WEIGHT,
-    renyi_alpha: float = DEFAULT_RENYI_ALPHA,
-    renyi_rank_k: int = DEFAULT_RENYI_RANK,
-    mmib_mae_weight: float = 1.0,
-    mmib_kl_weight: float = 1e-4,
     token_reg_weight: float = DEFAULT_TOKEN_REG_WEIGHT,
     hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
     acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
@@ -771,10 +630,8 @@ def train_one_epoch(
         "sim": 0.0,
         "recon": 0.0,
         "moe": 0.0,
-        "mmib": 0.0,
-        "mmib_mi": 0.0,
-        "mmib_mae": 0.0,
-        "mmib_kl": 0.0,
+        "supcon": 0.0,
+        "unsupcon": 0.0,
         "token_reg": 0.0,
         "hypergraph_reg": 0.0,
         "acc5_loss": 0.0,
@@ -798,16 +655,13 @@ def train_one_epoch(
             preds,
             labels,
             aux,
-            alpha=alpha,
-            beta=beta,
-            gamma=gamma,
-            delta=delta,
+            sim_weight=sim_weight,
+            recon_weight=recon_weight,
+            moe_weight=moe_weight,
+            supcon_weight=supcon_weight,
+            unsupcon_weight=unsupcon_weight,
             sim_margin=sim_margin,
             moe_balance_weight=moe_balance_weight,
-            renyi_alpha=renyi_alpha,
-            renyi_rank_k=renyi_rank_k,
-            mmib_mae_weight=mmib_mae_weight,
-            mmib_kl_weight=mmib_kl_weight,
             token_reg_weight=token_reg_weight,
             hypergraph_reg_weight=hypergraph_reg_weight,
             acc5_loss_weight=acc5_loss_weight,
@@ -824,10 +678,8 @@ def train_one_epoch(
         totals["sim"] += stats["sim_loss"] * batch_size
         totals["recon"] += stats["recon_loss"] * batch_size
         totals["moe"] += stats["moe_loss"] * batch_size
-        totals["mmib"] += stats["mmib_loss"] * batch_size
-        totals["mmib_mi"] += stats["mmib_mi"] * batch_size
-        totals["mmib_mae"] += stats["mmib_mae"] * batch_size
-        totals["mmib_kl"] += stats["mmib_kl"] * batch_size
+        totals["supcon"] += stats["supcon_loss"] * batch_size
+        totals["unsupcon"] += stats["unsupcon_loss"] * batch_size
         totals["token_reg"] += stats["token_reg_loss"] * batch_size
         totals["hypergraph_reg"] += stats["hypergraph_reg_loss"] * batch_size
         totals["acc5_loss"] += stats["acc5_loss"] * batch_size
@@ -844,10 +696,8 @@ def train_one_epoch(
         "train_sim_loss": totals["sim"] / max(1, total_samples),
         "train_recon_loss": totals["recon"] / max(1, total_samples),
         "train_moe_loss": totals["moe"] / max(1, total_samples),
-        "train_mmib_loss": totals["mmib"] / max(1, total_samples),
-        "train_mmib_mi": totals["mmib_mi"] / max(1, total_samples),
-        "train_mmib_mae": totals["mmib_mae"] / max(1, total_samples),
-        "train_mmib_kl": totals["mmib_kl"] / max(1, total_samples),
+        "train_supcon_loss": totals["supcon"] / max(1, total_samples),
+        "train_unsupcon_loss": totals["unsupcon"] / max(1, total_samples),
         "train_token_reg_loss": totals["token_reg"] / max(1, total_samples),
         "train_hypergraph_reg_loss": totals["hypergraph_reg"] / max(1, total_samples),
         "train_acc5_loss": totals["acc5_loss"] / max(1, total_samples),

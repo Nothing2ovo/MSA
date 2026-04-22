@@ -22,8 +22,8 @@ BASE_DIR = PROJECT_ROOT
 PLOTS_DIR = os.path.join(BASE_DIR, "plots")
 RESULTS_FILE = os.path.join(BASE_DIR, "results", "final_test_results.txt")
 MODEL_DIR = os.path.join(BASE_DIR, "model file")
-BEST_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhm_mosei_tgib.pt")
-BEST_MAE_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhm_mosei_mae_ref.pt")
+BEST_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhib_4token_direct_pred.pt")
+BEST_MAE_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhib_4token_mae_ref.pt")
 DATA_FILE = os.path.join(BASE_DIR, "data", "aligned_50e.pkl")
 
 
@@ -43,12 +43,6 @@ def set_seed(seed: int = 3407, deterministic: bool = False) -> None:
 
 
 def model_selection_score(metrics: Dict[str, float]) -> float:
-    """
-    Plateau score used by LR scheduler.
-    Smaller is better. Strongly classification-oriented, with Acc5 as the
-    primary signal and Acc7 as the secondary signal. MAE/Corr are only mild
-    stabilizers to avoid saving obviously degraded checkpoints.
-    """
     cls_reward = (
         1.80 * metrics["Acc5"]
         + 1.20 * metrics["Acc7"]
@@ -61,10 +55,6 @@ def model_selection_score(metrics: Dict[str, float]) -> float:
 
 
 def classification_priority_tuple(metrics: Dict[str, float]) -> tuple:
-    """
-    Lexicographic checkpoint priority. Larger tuple is better.
-    Order: Acc5 > Acc7 > Acc2_posneg > F1_posneg > Corr > -MAE
-    """
     return (
         round(float(metrics["Acc5"]), 6),
         round(float(metrics["Acc7"]), 6),
@@ -76,34 +66,15 @@ def classification_priority_tuple(metrics: Dict[str, float]) -> tuple:
 
 
 def is_better_checkpoint(current: Dict[str, float], best: Dict[str, float] | None) -> bool:
-    """
-    Save checkpoints with a clear classification preference:
-    1) Acc5 improvement >= 0.0020 always wins;
-    2) otherwise Acc7 improvement >= 0.0020 wins if Acc5 is not worse by > 0.0010;
-    3) otherwise compare the full lexicographic priority tuple.
-    This avoids missing later classification peaks because of tiny MAE noise.
-    """
     if best is None:
         return True
-
     acc5_gap = float(current["Acc5"] - best["Acc5"])
     acc7_gap = float(current["Acc7"] - best["Acc7"])
-
     if acc5_gap >= 0.0020:
         return True
     if acc7_gap >= 0.0020 and acc5_gap >= -0.0010:
         return True
-
     return classification_priority_tuple(current) > classification_priority_tuple(best)
-
-
-def compute_ib_weight_schedule(epoch: int, warmup_epochs: int, ramp_epochs: int, max_delta: float) -> float:
-    if epoch < warmup_epochs:
-        return 0.0
-    if ramp_epochs <= 0:
-        return max_delta
-    progress = min(1.0, (epoch - warmup_epochs + 1) / float(ramp_epochs))
-    return max_delta * progress
 
 
 def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) -> None:
@@ -123,15 +94,15 @@ def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) ->
     plt.close()
 
     plt.figure(figsize=(10, 6))
-    plt.plot(epochs, history["valid_mmib_loss"], label="valid TGIB loss")
-    plt.plot(epochs, history["valid_mmib_mi"], label="valid TGIB MI")
-    plt.plot(epochs, history["valid_filter_shift"], label="valid TGIB shift")
+    plt.plot(epochs, history["valid_supcon_loss"], label="valid shared supcon")
+    plt.plot(epochs, history["valid_unsupcon_loss"], label="valid shared unsupcon")
+    plt.plot(epochs, history["valid_shared_view_gap"], label="valid shared view gap")
     plt.xlabel("Epoch")
     plt.ylabel("Value")
-    plt.title("Transformer-guided IB Metrics")
+    plt.title("Shared Hypergraph Contrastive Metrics")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "tgib_metrics.png"))
+    plt.savefig(os.path.join(save_dir, "shared_hypergraph_contrastive_metrics.png"))
     plt.close()
 
     plt.figure(figsize=(10, 6))
@@ -160,7 +131,7 @@ def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) ->
     plt.plot(epochs, history["token_max_weight"], label="token max weight")
     plt.xlabel("Epoch")
     plt.ylabel("Value")
-    plt.title("Structure and Token Weight Metrics")
+    plt.title("Structure and 4-Token Metrics")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "structure_token_metrics.png"))
@@ -172,16 +143,14 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
     analysis = metrics["analysis"]
     lines = [
         f"[{timestamp}]",
-        "========== Final Test (mosei dhm + balanced hg / relaxed 4-token / mild tgib+) ==========",
+        "========== Final Test (decoupled shared hypergraph + shared CL + TMoEs + 4-token direct prediction) ==========",
         f"Test total loss: {metrics['total_loss']:.4f}",
         f"Test task loss : {metrics['task_loss']:.4f}",
         f"Test sim loss  : {metrics['sim_loss']:.4f}",
         f"Test recon loss: {metrics['recon_loss']:.4f}",
         f"Test moe loss  : {metrics['moe_loss']:.4f}",
-        f"Test tgib loss : {metrics['mmib_loss']:.4f}",
-        f"  tgib mi      : {metrics['mmib_mi']:.4f}",
-        f"  tgib mae     : {metrics['mmib_mae']:.4f}",
-        f"  tgib kl      : {metrics['mmib_kl']:.6f}",
+        f"Test supcon    : {metrics['supcon_loss']:.4f}",
+        f"Test unsupcon  : {metrics['unsupcon_loss']:.4f}",
         f"  token reg    : {metrics['token_reg_loss']:.4f}",
         f"  hyper reg    : {metrics['hypergraph_reg_loss']:.4f}",
         f"  token entropy: {metrics['token_entropy']:.4f}",
@@ -203,8 +172,8 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
         f"  attn s->s/t/v/a     : {analysis['attn_shared_to_shared']:.4f} / {analysis['attn_shared_to_text']:.4f} / {analysis['attn_shared_to_vision']:.4f} / {analysis['attn_shared_to_audio']:.4f}",
         f"  gate t/v/a          : {analysis['gate_t_mean']:.4f} / {analysis['gate_v_mean']:.4f} / {analysis['gate_a_mean']:.4f}",
         f"  token floor/peak    : {analysis['token_floor_penalty']:.4f} / {analysis['token_peak_penalty']:.4f}",
-        f"  latent std mean     : {analysis['filtered_std_mean']:.4f}",
-        f"  tgib shift          : {analysis['filter_shift']:.4f}",
+        f"  shared view gap     : {analysis['shared_view_gap']:.4f}",
+        f"  fused repr norm     : {analysis['fused_repr_norm']:.4f}",
         "",
     ]
     with open(file_path, "a", encoding="utf-8") as f:
@@ -215,7 +184,6 @@ def print_epoch_summary(
     epoch: int,
     num_epochs: int,
     lr: float,
-    ib_delta: float,
     train_stats: Dict[str, float],
     valid_metrics: Dict[str, float],
     score: float,
@@ -225,13 +193,13 @@ def print_epoch_summary(
 ) -> None:
     print(f"\n[Epoch {epoch + 1:02d}/{num_epochs}]")
     print(f"  lr              = {lr:.6f}")
-    print(f"  tgib delta      = {ib_delta:.4f}")
     print(
         f"  train total/task= {train_stats['train_total_loss']:.4f} / {train_stats['train_task_loss']:.4f} | "
         f"sim={train_stats['train_sim_loss']:.4f} recon={train_stats['train_recon_loss']:.4f} "
-        f"moe={train_stats['train_moe_loss']:.4f} token_reg={train_stats['train_token_reg_loss']:.4f} "
-        f"hyper_reg={train_stats['train_hypergraph_reg_loss']:.4f} tgib={train_stats['train_mmib_loss']:.4f} "
-        f"cls5={train_stats['train_acc5_loss']:.4f} cls7={train_stats['train_acc7_loss']:.4f}"
+        f"moe={train_stats['train_moe_loss']:.4f} supcon={train_stats['train_supcon_loss']:.4f} "
+        f"unsupcon={train_stats['train_unsupcon_loss']:.4f} token_reg={train_stats['train_token_reg_loss']:.4f} "
+        f"hyper_reg={train_stats['train_hypergraph_reg_loss']:.4f} cls5={train_stats['train_acc5_loss']:.4f} "
+        f"cls7={train_stats['train_acc7_loss']:.4f}"
     )
     print(
         f"  valid MAE/Corr  = {valid_metrics['MAE']:.4f} / {valid_metrics['Corr']:.4f} | "
@@ -242,14 +210,11 @@ def print_epoch_summary(
     print(
         f"  valid losses    = total {valid_metrics['total_loss']:.4f} | task {valid_metrics['task_loss']:.4f} | "
         f"sim {valid_metrics['sim_loss']:.4f} | recon {valid_metrics['recon_loss']:.4f} | "
-        f"moe {valid_metrics['moe_loss']:.4f} | hg {valid_metrics['hypergraph_reg_loss']:.4f} | tgib {valid_metrics['mmib_loss']:.4f}"
+        f"moe {valid_metrics['moe_loss']:.4f} | supcon {valid_metrics['supcon_loss']:.4f} | "
+        f"unsupcon {valid_metrics['unsupcon_loss']:.4f} | hg {valid_metrics['hypergraph_reg_loss']:.4f}"
     )
     print(
-        f"  tgib detail     = mi {valid_metrics['mmib_mi']:.4f} | mae {valid_metrics['mmib_mae']:.4f} | "
-        f"kl {valid_metrics['mmib_kl']:.6f} | shift {valid_metrics['analysis']['filter_shift']:.4f}"
-    )
-    print(
-        f"  token detail    = entropy {valid_metrics['token_entropy']:.4f} | prior-fit {valid_metrics['token_balance']:.4f} | "
+        f"  4-token detail  = entropy {valid_metrics['token_entropy']:.4f} | prior-fit {valid_metrics['token_balance']:.4f} | "
         f"maxw {valid_metrics['token_max_weight']:.4f} | dom {valid_metrics['analysis']['token_dominance_margin']:.4f} | "
         f"floor {valid_metrics['analysis']['token_floor_penalty']:.4f} | peak {valid_metrics['analysis']['token_peak_penalty']:.4f}"
     )
@@ -257,6 +222,10 @@ def print_epoch_summary(
         f"  structure       = cross/intra {valid_metrics['analysis']['cross_edge_weight_mean']:.4f} / {valid_metrics['analysis']['intra_edge_weight_mean']:.4f} | "
         f"edge_std {valid_metrics['analysis']['edge_weight_std']:.4f} | gap {valid_metrics['analysis']['cross_intra_gap']:.4f} | spread {valid_metrics['analysis']['edge_spread']:.4f} | "
         f"token s/t/v/a {valid_metrics['analysis']['token_weight_shared']:.4f} / {valid_metrics['analysis']['token_weight_text']:.4f} / {valid_metrics['analysis']['token_weight_vision']:.4f} / {valid_metrics['analysis']['token_weight_audio']:.4f}"
+    )
+    print(
+        f"  shared CL       = sup {valid_metrics['supcon_loss']:.4f} | unsup {valid_metrics['unsupcon_loss']:.4f} | "
+        f"view gap {valid_metrics['analysis']['shared_view_gap']:.4f}"
     )
     print(f"  selection score = {score:.4f}")
     if improved:
@@ -278,23 +247,17 @@ def main() -> None:
     patience = 10
     grad_clip = 1.0
 
-    alpha = 0.05
-    beta = 0.05
-    gamma = 0.10
-    delta = 0.0080
+    sim_weight = 0.05
+    recon_weight = 0.05
+    moe_weight = 0.10
+    supcon_weight = 0.05
+    unsupcon_weight = 0.05
     sim_margin = 0.20
 
-    renyi_alpha = 1.9
-    renyi_rank_k = 10
-    mmib_mae_weight = 0.5
-    mmib_kl_weight = 7.5e-5
     token_reg_weight = 0.04
     hypergraph_reg_weight = 0.055
     acc5_loss_weight = 0.10
     acc7_loss_weight = 0.06
-
-    ib_warmup_epochs = 6
-    ib_ramp_epochs = 8
 
     dropout = 0.50
     conv_hidden = 128
@@ -305,13 +268,16 @@ def main() -> None:
     num_experts = 3
     top_k = 1
     num_heads = 4
-    hg_layers = 3
+    hg_layers = 2
     intra_k = 3
+    shared_edge_drop = 0.30
 
-    print("[Config] classification-priority checkpoint / Acc5+Acc7 ordinal auxiliary / soft-prior-4token / mild TGIB")
+    print("[Config] decoupled shared-hypergraph / shared CL / TMoEs / 4-token direct prediction")
     print(
-        f"[Config] delta={delta:.4f} | mmib_kl={mmib_kl_weight:.6f} | hyper_reg_w={hypergraph_reg_weight:.4f} "
-        f"| cls5_w={acc5_loss_weight:.3f} | cls7_w={acc7_loss_weight:.3f} | ckpt=Acc5>Acc7>Acc2>F1"
+        f"[Config] sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
+        f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
+        f"token_reg={token_reg_weight:.3f} hyper_reg={hypergraph_reg_weight:.3f} "
+        f"edge_drop={shared_edge_drop:.2f} | ckpt=Acc5>Acc7>Acc2>F1"
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -342,6 +308,7 @@ def main() -> None:
         hg_layers=hg_layers,
         intra_k=intra_k,
         dropout=dropout,
+        shared_edge_drop=shared_edge_drop,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -357,9 +324,9 @@ def main() -> None:
         "valid_total_loss": [],
         "valid_mae": [],
         "valid_corr": [],
-        "valid_mmib_loss": [],
-        "valid_mmib_mi": [],
-        "valid_filter_shift": [],
+        "valid_supcon_loss": [],
+        "valid_unsupcon_loss": [],
+        "valid_shared_view_gap": [],
         "valid_acc2_posneg": [],
         "valid_f1_posneg": [],
         "valid_acc5": [],
@@ -377,23 +344,18 @@ def main() -> None:
     }
 
     for epoch in range(num_epochs):
-        current_delta = compute_ib_weight_schedule(epoch=epoch, warmup_epochs=ib_warmup_epochs, ramp_epochs=ib_ramp_epochs, max_delta=delta)
-
         train_stats = train_one_epoch(
             model,
             train_loader,
             optimizer,
             device,
-            alpha=alpha,
-            beta=beta,
-            gamma=gamma,
-            delta=current_delta,
+            sim_weight=sim_weight,
+            recon_weight=recon_weight,
+            moe_weight=moe_weight,
+            supcon_weight=supcon_weight,
+            unsupcon_weight=unsupcon_weight,
             sim_margin=sim_margin,
             grad_clip=grad_clip,
-            renyi_alpha=renyi_alpha,
-            renyi_rank_k=renyi_rank_k,
-            mmib_mae_weight=mmib_mae_weight,
-            mmib_kl_weight=mmib_kl_weight,
             token_reg_weight=token_reg_weight,
             hypergraph_reg_weight=hypergraph_reg_weight,
             acc5_loss_weight=acc5_loss_weight,
@@ -403,15 +365,12 @@ def main() -> None:
             model,
             valid_loader,
             device,
-            alpha=alpha,
-            beta=beta,
-            gamma=gamma,
-            delta=current_delta,
+            sim_weight=sim_weight,
+            recon_weight=recon_weight,
+            moe_weight=moe_weight,
+            supcon_weight=supcon_weight,
+            unsupcon_weight=unsupcon_weight,
             sim_margin=sim_margin,
-            renyi_alpha=renyi_alpha,
-            renyi_rank_k=renyi_rank_k,
-            mmib_mae_weight=mmib_mae_weight,
-            mmib_kl_weight=mmib_kl_weight,
             token_reg_weight=token_reg_weight,
             hypergraph_reg_weight=hypergraph_reg_weight,
             acc5_loss_weight=acc5_loss_weight,
@@ -424,9 +383,9 @@ def main() -> None:
         history["valid_total_loss"].append(valid_metrics["total_loss"])
         history["valid_mae"].append(valid_metrics["MAE"])
         history["valid_corr"].append(valid_metrics["Corr"])
-        history["valid_mmib_loss"].append(valid_metrics["mmib_loss"])
-        history["valid_mmib_mi"].append(valid_metrics["mmib_mi"])
-        history["valid_filter_shift"].append(valid_metrics["analysis"]["filter_shift"])
+        history["valid_supcon_loss"].append(valid_metrics["supcon_loss"])
+        history["valid_unsupcon_loss"].append(valid_metrics["unsupcon_loss"])
+        history["valid_shared_view_gap"].append(valid_metrics["analysis"]["shared_view_gap"])
         history["valid_acc2_posneg"].append(valid_metrics["Acc2_posneg"])
         history["valid_f1_posneg"].append(valid_metrics["F1_posneg"])
         history["valid_acc5"].append(valid_metrics["Acc5"])
@@ -466,7 +425,6 @@ def main() -> None:
             epoch=epoch,
             num_epochs=num_epochs,
             lr=optimizer.param_groups[0]["lr"],
-            ib_delta=current_delta,
             train_stats=train_stats,
             valid_metrics=valid_metrics,
             score=score,
@@ -479,13 +437,13 @@ def main() -> None:
             print("early stopping triggered")
             break
 
-    print("\nloading best DHM + TGIB model...")
+    print("\nloading best 4-token direct-pred model...")
     model.load_state_dict(torch.load(BEST_MODEL_FILE, map_location=device))
     final_valid = evaluate(
         model, valid_loader, device,
-        alpha=alpha, beta=beta, gamma=gamma, delta=delta,
-        sim_margin=sim_margin, renyi_alpha=renyi_alpha, renyi_rank_k=renyi_rank_k,
-        mmib_mae_weight=mmib_mae_weight, mmib_kl_weight=mmib_kl_weight,
+        sim_weight=sim_weight, recon_weight=recon_weight, moe_weight=moe_weight,
+        supcon_weight=supcon_weight, unsupcon_weight=unsupcon_weight,
+        sim_margin=sim_margin,
         token_reg_weight=token_reg_weight,
         hypergraph_reg_weight=hypergraph_reg_weight,
         acc5_loss_weight=acc5_loss_weight,
@@ -493,9 +451,9 @@ def main() -> None:
     )
     final_test = evaluate(
         model, test_loader, device,
-        alpha=alpha, beta=beta, gamma=gamma, delta=delta,
-        sim_margin=sim_margin, renyi_alpha=renyi_alpha, renyi_rank_k=renyi_rank_k,
-        mmib_mae_weight=mmib_mae_weight, mmib_kl_weight=mmib_kl_weight,
+        sim_weight=sim_weight, recon_weight=recon_weight, moe_weight=moe_weight,
+        supcon_weight=supcon_weight, unsupcon_weight=unsupcon_weight,
+        sim_margin=sim_margin,
         token_reg_weight=token_reg_weight,
         hypergraph_reg_weight=hypergraph_reg_weight,
         acc5_loss_weight=acc5_loss_weight,
@@ -503,11 +461,11 @@ def main() -> None:
     )
 
     print("\n========== Final Validation ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "mmib_loss", "token_reg_loss", "hypergraph_reg_loss", "acc5_loss", "acc7_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "hypergraph_reg_loss", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_valid[k]:.4f}")
 
     print("\n========== Final Test ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "mmib_loss", "token_reg_loss", "hypergraph_reg_loss", "acc5_loss", "acc7_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "hypergraph_reg_loss", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_test[k]:.4f}")
 
     save_final_test_results(RESULTS_FILE, final_test)

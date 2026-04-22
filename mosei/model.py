@@ -135,26 +135,19 @@ class SparseTMoE(nn.Module):
 
 
 class TokenLevelDynamicWeighting(nn.Module):
-    """
-    软先验版 4-token 融合：
-    1) 保留 "shared 主导、text-private 次之" 的归纳偏置；
-    2) 但把原先较硬的 prior mix / min floor 改成更柔和的引导；
-    3) 当样本本身已经给出清晰 token 重要性时，优先相信数据；
-       当样本较不确定时，再更多借助先验稳定训练。
-    """
     def __init__(
         self,
         shared_dim: int,
         private_dim: int,
         token_dim: int = 128,
         dropout: float = 0.1,
-        temperature: float = 1.12,
-        flatten_power: float = 0.98,
-        prior_mix: float = 0.12,
+        temperature: float = 1.10,
+        flatten_power: float = 0.97,
+        prior_mix: float = 0.14,
         shared_min_weight: float = 0.18,
         private_min_weight: float = 0.05,
-        gate_scale: float = 0.48,
-        shared_to_private_scale: float = 0.08,
+        gate_scale: float = 0.45,
+        shared_to_private_scale: float = 0.06,
     ):
         super().__init__()
         self.temperature = max(1e-3, float(temperature))
@@ -205,8 +198,8 @@ class TokenLevelDynamicWeighting(nn.Module):
             nn.Linear(token_dim, 1),
         )
         self.shared_affinity_proj = nn.Linear(token_dim, token_dim)
-        self.base_prior_logits = nn.Parameter(torch.tensor([0.55, 0.18, 0.00, -0.06], dtype=torch.float32))
-        self.token_bias = nn.Parameter(torch.tensor([0.08, 0.03, 0.00, 0.00], dtype=torch.float32))
+        self.base_prior_logits = nn.Parameter(torch.tensor([0.50, 0.18, 0.00, -0.04], dtype=torch.float32))
+        self.token_bias = nn.Parameter(torch.tensor([0.05, 0.02, 0.00, 0.00], dtype=torch.float32))
         self.out_norm = nn.LayerNorm(token_dim)
 
     def forward(
@@ -248,17 +241,16 @@ class TokenLevelDynamicWeighting(nn.Module):
         )
         private_bonus = torch.cat([
             torch.zeros_like(shared_affinity[:, :1]),
-            0.08 * private_consistency,
+            0.06 * private_consistency,
         ], dim=1)
 
-        prior_logits = self.base_prior_logits.view(1, -1)
         token_scores = (
             compat_score
             + 0.22 * local_score
-            + 0.30 * shared_affinity
+            + 0.28 * shared_affinity
             + private_bonus
             + self.token_bias.view(1, -1)
-            + prior_logits
+            + self.base_prior_logits.view(1, -1)
         )
         token_weights = torch.softmax(token_scores / self.temperature, dim=1)
 
@@ -278,14 +270,14 @@ class TokenLevelDynamicWeighting(nn.Module):
             dtype=token_weights.dtype,
         ).view(1, -1)
         under_floor = F.relu(soft_floor - token_weights)
-        token_weights = token_weights + 0.35 * under_floor
+        token_weights = token_weights + 0.30 * under_floor
         token_weights = token_weights / token_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         guided_tokens = typed_tokens.clone()
         guided_tokens[:, 1:, :] = guided_tokens[:, 1:, :] + self.shared_to_private_scale * shared_anchor.unsqueeze(1)
 
         token_scale = 1.0 + self.gate_scale * (token_weights - prior_dist)
-        token_scale = token_scale.clamp(min=0.88, max=1.28)
+        token_scale = token_scale.clamp(min=0.90, max=1.25)
         weighted_tokens = self.out_norm(guided_tokens * token_scale.unsqueeze(-1))
 
         dominance_margin = token_weights[:, 0] - token_weights[:, 1:].max(dim=1).values
@@ -336,63 +328,6 @@ class TokenTransformerBlock(nn.Module):
         return x, attn_weights
 
 
-class TransformerGuidedIB(nn.Module):
-    def __init__(self, token_dim: int, num_tokens: int = 4, num_heads: int = 4, dropout: float = 0.1, latent_dim: int = None):
-        super().__init__()
-        latent_dim = latent_dim or token_dim
-        self.token_embed = nn.Parameter(torch.zeros(1, num_tokens, token_dim))
-        nn.init.trunc_normal_(self.token_embed, std=0.02)
-        self.block = TokenTransformerBlock(token_dim=token_dim, num_heads=num_heads, dropout=dropout)
-        self.pre_norm = nn.LayerNorm(token_dim)
-        self.mu_proj = nn.Linear(token_dim, latent_dim)
-        self.logvar_proj = nn.Linear(token_dim, latent_dim)
-        self.post = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, tokens: torch.Tensor, token_weights: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        x = tokens + self.token_embed[:, :tokens.size(1), :]
-        x, attn_weights = self.block(x)
-        if token_weights is None:
-            pool_weights = torch.full(
-                (x.size(0), x.size(1)),
-                1.0 / float(x.size(1)),
-                device=x.device,
-                dtype=x.dtype,
-            )
-        else:
-            pool_weights = token_weights / token_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-        pooled = self.pre_norm(torch.sum(x * pool_weights.unsqueeze(-1), dim=1))
-        mu = self.mu_proj(pooled)
-        logvar = self.logvar_proj(pooled).clamp(min=-8.0, max=8.0)
-
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z = mu + std * eps
-        else:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.zeros_like(std)
-            z = mu
-        z = self.post(z)
-
-        aux = {
-            "transformer_tokens": x,
-            "transformer_attn": attn_weights,
-            "pre_bottleneck": pooled,
-            "pool_weights": pool_weights,
-            "mu": mu,
-            "logvar": logvar,
-            "std": std,
-            "eps": eps,
-            "post_bottleneck": z,
-        }
-        return z, aux
-
-
 class RegressionHead(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int = 128, dropout: float = 0.1):
         super().__init__()
@@ -413,9 +348,13 @@ class RegressionHead(nn.Module):
 
 class DHMModel(nn.Module):
     """
-    Conv1D -> Factorized(shared/private) -> HGL(shared) + TMoEs(private)
-    -> 4-token moderate dynamic weighting -> Transformer-guided IB -> Prediction
+    Conv1D -> Decoupling(shared/private)
+           -> unified shared hypergraph + contrastive views
+           -> TMoEs on private branches
+           -> 4-token fusion
+           -> direct prediction
     """
+
     def __init__(
         self,
         text_dim: int,
@@ -429,11 +368,14 @@ class DHMModel(nn.Module):
         num_experts: int = 3,
         top_k: int = 1,
         num_heads: int = 4,
-        hg_layers: int = 3,
+        hg_layers: int = 2,
         intra_k: int = 3,
         dropout: float = 0.5,
+        shared_edge_drop: float = 0.30,
     ):
         super().__init__()
+        self.shared_edge_drop = float(shared_edge_drop)
+
         self.text_conv = TemporalConvEncoder(text_dim, conv_hidden, kernel_size=3, dropout=dropout)
         self.vision_conv = TemporalConvEncoder(vision_dim, conv_hidden, kernel_size=3, dropout=dropout)
         self.audio_conv = TemporalConvEncoder(audio_dim, conv_hidden, kernel_size=3, dropout=dropout)
@@ -450,10 +392,6 @@ class DHMModel(nn.Module):
         self.decoder_v = SequenceDecoder(shared_dim + private_dim, conv_hidden, dropout=dropout)
         self.decoder_a = SequenceDecoder(shared_dim + private_dim, conv_hidden, dropout=dropout)
 
-        self.shared_pool_t = AttentionPool(shared_dim, hidden_dim=max(64, shared_dim), dropout=dropout)
-        self.shared_pool_v = AttentionPool(shared_dim, hidden_dim=max(64, shared_dim), dropout=dropout)
-        self.shared_pool_a = AttentionPool(shared_dim, hidden_dim=max(64, shared_dim), dropout=dropout)
-
         self.hypergraph = HypergraphEncoder(
             node_dim=shared_dim,
             hidden_dim=hyper_hidden,
@@ -462,6 +400,12 @@ class DHMModel(nn.Module):
             dropout=dropout,
             max_batch_size=32,
             max_seq_len=64,
+        )
+        self.shared_proj_head = nn.Sequential(
+            nn.Linear(hyper_hidden, hyper_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hyper_hidden, hyper_hidden),
         )
 
         self.tmoe_t = SparseTMoE(private_dim, num_experts=num_experts, top_k=top_k, num_heads=num_heads, dropout=dropout)
@@ -473,21 +417,9 @@ class DHMModel(nn.Module):
             private_dim=private_dim,
             token_dim=fusion_dim,
             dropout=dropout,
-            temperature=1.08,
-            flatten_power=0.95,
-            prior_mix=0.25,
-            shared_min_weight=0.24,
-            private_min_weight=0.09,
-            gate_scale=0.60,
-            shared_to_private_scale=0.10,
         )
-        self.tgib = TransformerGuidedIB(
-            token_dim=fusion_dim,
-            num_tokens=4,
-            num_heads=num_heads,
-            dropout=dropout,
-            latent_dim=fusion_dim,
-        )
+        self.token_fusion_block = TokenTransformerBlock(token_dim=fusion_dim, num_heads=num_heads, dropout=dropout)
+        self.fusion_norm = nn.LayerNorm(fusion_dim)
         self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
 
     def forward(self, text: torch.Tensor, vision: torch.Tensor, audio: torch.Tensor):
@@ -506,18 +438,28 @@ class DHMModel(nn.Module):
         rec_v = self.decoder_v(torch.cat([e_irr_v, e_spe_v], dim=-1))
         rec_a = self.decoder_a(torch.cat([e_irr_a, e_spe_a], dim=-1))
 
-        # 论文中的 HGL 先保留 shared 序列级节点，再在当前 batch 内构造超图，
-        # 而不是先把每个模态池化成单个节点。
         shared_sequences = torch.stack([e_irr_t, e_irr_v, e_irr_a], dim=1)
-        hyper_repr, hyper_aux = self.hypergraph(shared_sequences)
+        hyper_repr, hyper_aux = self.hypergraph(shared_sequences, edge_drop_rate=0.0, deterministic_drop=False)
+
+        # second view for shared-hypergraph unsupervised contrastive learning
+        hyper_repr_aug, hyper_aux_aug = self.hypergraph(
+            shared_sequences,
+            edge_drop_rate=self.shared_edge_drop,
+            deterministic_drop=not self.training,
+        )
+        shared_proj = F.normalize(self.shared_proj_head(hyper_repr), dim=-1)
+        shared_proj_aug = F.normalize(self.shared_proj_head(hyper_repr_aug), dim=-1)
 
         p_t, tmoe_t_aux = self.tmoe_t(e_spe_t)
         p_v, tmoe_v_aux = self.tmoe_v(e_spe_v)
         p_a, tmoe_a_aux = self.tmoe_a(e_spe_a)
 
         weighted_tokens, token_fusion_aux = self.token_weighting(hyper_repr, p_t, p_v, p_a)
-        z, tgib_aux = self.tgib(weighted_tokens, token_fusion_aux["token_weights"])
-        pred = self.regressor(z)
+        fused_tokens, fusion_attn = self.token_fusion_block(weighted_tokens)
+        token_weights = token_fusion_aux["token_weights"]
+        fused_repr = torch.sum(fused_tokens * token_weights.unsqueeze(-1), dim=1)
+        fused_repr = self.fusion_norm(fused_repr)
+        pred = self.regressor(fused_repr)
 
         aux = {
             "c_t": c_t,
@@ -534,18 +476,22 @@ class DHMModel(nn.Module):
             "rec_a": rec_a,
             "shared_sequences": shared_sequences,
             "hyper_repr": hyper_repr,
+            "hyper_repr_aug": hyper_repr_aug,
+            "shared_proj": shared_proj,
+            "shared_proj_aug": shared_proj_aug,
             "private_t": p_t,
             "private_v": p_v,
             "private_a": p_a,
             "token_inputs": token_fusion_aux["raw_tokens"],
             "weighted_tokens": weighted_tokens,
-            "fused_repr": torch.sum(token_fusion_aux["weighted_tokens"] * token_fusion_aux["token_weights"].unsqueeze(-1), dim=1),
-            "filtered_repr": z,
+            "fused_tokens": fused_tokens,
+            "fused_repr": fused_repr,
             "hyper_aux": hyper_aux,
+            "hyper_aux_aug": hyper_aux_aug,
             "tmoe_t_aux": tmoe_t_aux,
             "tmoe_v_aux": tmoe_v_aux,
             "tmoe_a_aux": tmoe_a_aux,
             "token_fusion_aux": token_fusion_aux,
-            "tgib_aux": tgib_aux,
+            "fusion_attn": fusion_attn,
         }
         return pred, aux
