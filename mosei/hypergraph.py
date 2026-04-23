@@ -35,7 +35,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
     def _build_cross_modal_edges(self, shared_norm: torch.Tensor, H: torch.Tensor) -> None:
         batch_size, _, seq_len, feat_dim = shared_norm.shape
         device = shared_norm.device
-        dtype = shared_norm.dtype
+        dest_dtype = H.dtype
         bt = batch_size * seq_len
 
         # [B*T, 3, D]
@@ -53,7 +53,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
         # Tri-modal edges: edge ids [0, BT)
         tri_center = F.normalize(nodes_bt.mean(dim=1), dim=-1)
         tri_scores = torch.sum(nodes_bt * tri_center.unsqueeze(1), dim=-1)
-        tri_weights = self._soft_membership(tri_scores).to(dtype)
+        tri_weights = self._soft_membership(tri_scores).to(dest_dtype)
         tri_edge_ids = bt_idx.unsqueeze(1).expand(-1, 3)
         H.index_put_(
             (node_idx_all.reshape(-1), tri_edge_ids.reshape(-1)),
@@ -66,7 +66,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
             pair_nodes = nodes_bt[:, list(pair), :]  # [BT, 2, D]
             pair_center = F.normalize(pair_nodes.mean(dim=1), dim=-1)
             pair_scores = torch.sum(pair_nodes * pair_center.unsqueeze(1), dim=-1)
-            pair_weights = self._soft_membership(pair_scores).to(dtype)
+            pair_weights = self._soft_membership(pair_scores).to(dest_dtype)
             pair_node_idx = node_idx_all[:, list(pair)]
             edge_ids = (pair_offset * bt + bt_idx).unsqueeze(1).expand(-1, 2)
             H.index_put_(
@@ -78,7 +78,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
     def _build_intra_modal_edges(self, shared_norm: torch.Tensor, H: torch.Tensor, cross_edges: int) -> None:
         batch_size, num_modalities, seq_len, feat_dim = shared_norm.shape
         device = shared_norm.device
-        dtype = shared_norm.dtype
+        dest_dtype = H.dtype
         bt = batch_size * seq_len
         topk = min(self.intra_k, max(1, bt - 1))
         flat_idx = torch.arange(bt, device=device)
@@ -92,7 +92,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
 
             members = torch.cat([flat_idx.unsqueeze(1), nn_idx], dim=1)  # [BT, topk+1]
             scores = sim_raw.gather(dim=1, index=members)
-            weights = self._soft_membership(scores).to(dtype)
+            weights = self._soft_membership(scores).to(dest_dtype)
 
             global_member_idx = self._flat_to_global_node(members, modality_idx=m, seq_len=seq_len)
             edge_ids = (cross_edges + m * bt + flat_idx).unsqueeze(1).expand_as(global_member_idx)
