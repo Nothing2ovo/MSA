@@ -42,6 +42,42 @@ def set_seed(seed: int = 3407, deterministic: bool = False) -> None:
     torch.backends.cudnn.benchmark = not deterministic
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+def save_model_state(model: torch.nn.Module, path: str) -> None:
+    torch.save(unwrap_model(model).state_dict(), path)
+
+
+def build_dataloaders(train_dataset, valid_dataset, test_dataset, batch_size: int) -> tuple:
+    cpu_count = os.cpu_count() or 4
+    num_workers = min(8, max(2, cpu_count // 2))
+    pin_memory = torch.cuda.is_available()
+    common_kwargs = {
+        "batch_size": batch_size,
+        "pin_memory": pin_memory,
+        "num_workers": num_workers,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        common_kwargs["prefetch_factor"] = 4
+
+    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=False, **common_kwargs)
+    valid_loader = DataLoader(valid_dataset, shuffle=False, drop_last=False, **common_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, drop_last=False, **common_kwargs)
+    return train_loader, valid_loader, test_loader, num_workers
+
+
+def maybe_wrap_dataparallel(model: torch.nn.Module, device: torch.device) -> tuple[torch.nn.Module, str]:
+    if device.type == "cuda":
+        gpu_count = torch.cuda.device_count()
+        if gpu_count >= 2:
+            model = torch.nn.DataParallel(model, device_ids=list(range(gpu_count)))
+            return model, f"DataParallel on {gpu_count} GPUs"
+    return model, "single device"
+
+
 def model_selection_score(metrics: Dict[str, float]) -> float:
     cls_reward = (
         1.80 * metrics["Acc5"]
@@ -240,6 +276,11 @@ def main() -> None:
     deterministic = os.environ.get("DET_TRAIN", "0") == "1"
     set_seed(seed, deterministic=deterministic)
 
+    torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     batch_size = 16
     num_epochs = 50
     learning_rate = 1e-4
@@ -280,18 +321,23 @@ def main() -> None:
         f"edge_drop={shared_edge_drop:.2f} | ckpt=Acc5>Acc7>Acc2>F1"
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_amp = device.type == "cuda"
     print(f"seed: {seed} | deterministic: {deterministic}")
     print("device:", device)
+    print("gpu_count:", gpu_count)
+    print("amp:", use_amp)
 
     train_dataset, valid_dataset, test_dataset, meta = load_mosei_from_pkl(DATA_FILE)
     print("dataset: MOSEI")
     print(f"train/valid/test: {meta['train_size']}/{meta['valid_size']}/{meta['test_size']}")
     print(f"dims: text={meta['text_dim']}, vision={meta['vision_dim']}, audio={meta['audio_dim']}")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False, pin_memory=torch.cuda.is_available())
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, pin_memory=torch.cuda.is_available())
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=torch.cuda.is_available())
+    train_loader, valid_loader, test_loader, num_workers = build_dataloaders(
+        train_dataset, valid_dataset, test_dataset, batch_size=batch_size
+    )
+    print("num_workers:", num_workers)
 
     model = DHMModel(
         text_dim=meta["text_dim"],
@@ -313,9 +359,12 @@ def main() -> None:
         hg_initial_residual_alpha=0.25,
         hg_soft_tau=0.85,
     ).to(device)
+    model, parallel_mode = maybe_wrap_dataparallel(model, device)
+    print("parallel_mode:", parallel_mode)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-5)
+    scaler = torch.amp.GradScaler(device="cuda", enabled=use_amp)
 
     best_score = float("inf")
     best_mae_ref = float("inf")
@@ -363,6 +412,8 @@ def main() -> None:
             hypergraph_reg_weight=hypergraph_reg_weight,
             acc5_loss_weight=acc5_loss_weight,
             acc7_loss_weight=acc7_loss_weight,
+            scaler=scaler,
+            use_amp=use_amp,
         )
         valid_metrics = evaluate(
             model,
@@ -378,6 +429,7 @@ def main() -> None:
             hypergraph_reg_weight=hypergraph_reg_weight,
             acc5_loss_weight=acc5_loss_weight,
             acc7_loss_weight=acc7_loss_weight,
+            use_amp=use_amp,
         )
         score = model_selection_score(valid_metrics)
         scheduler.step(score)
@@ -416,13 +468,13 @@ def main() -> None:
             }
             best_score = score
             wait = 0
-            torch.save(model.state_dict(), BEST_MODEL_FILE)
+            save_model_state(model, BEST_MODEL_FILE)
         else:
             wait += 1
 
         if valid_metrics["MAE"] < best_mae_ref - 1e-4:
             best_mae_ref = float(valid_metrics["MAE"])
-            torch.save(model.state_dict(), BEST_MAE_MODEL_FILE)
+            save_model_state(model, BEST_MAE_MODEL_FILE)
 
         print_epoch_summary(
             epoch=epoch,
@@ -441,7 +493,7 @@ def main() -> None:
             break
 
     print("\nloading best 4-token direct-pred model...")
-    model.load_state_dict(torch.load(BEST_MODEL_FILE, map_location=device))
+    unwrap_model(model).load_state_dict(torch.load(BEST_MODEL_FILE, map_location=device))
     final_valid = evaluate(
         model, valid_loader, device,
         sim_weight=sim_weight, recon_weight=recon_weight, moe_weight=moe_weight,
@@ -451,6 +503,7 @@ def main() -> None:
         hypergraph_reg_weight=hypergraph_reg_weight,
         acc5_loss_weight=acc5_loss_weight,
         acc7_loss_weight=acc7_loss_weight,
+        use_amp=use_amp,
     )
     final_test = evaluate(
         model, test_loader, device,
@@ -461,6 +514,7 @@ def main() -> None:
         hypergraph_reg_weight=hypergraph_reg_weight,
         acc5_loss_weight=acc5_loss_weight,
         acc7_loss_weight=acc7_loss_weight,
+        use_amp=use_amp,
     )
 
     print("\n========== Final Validation ==========")

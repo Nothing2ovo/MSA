@@ -458,6 +458,7 @@ def evaluate(
     hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
     acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
     acc7_loss_weight: float = DEFAULT_ACC7_LOSS_WEIGHT,
+    use_amp: bool = False,
 ):
     model.eval()
     total_samples = 0
@@ -511,29 +512,33 @@ def evaluate(
     all_preds = []
     all_labels = []
 
-    for batch in dataloader:
-        text = batch["text"].to(device).float()
-        vision = batch["vision"].to(device).float()
-        audio = batch["audio"].to(device).float()
-        labels = batch["label"].to(device).float().view(-1)
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
 
-        preds, aux = model(text, vision, audio)
-        _, stats = total_loss(
-            preds,
-            labels,
-            aux,
-            sim_weight=sim_weight,
-            recon_weight=recon_weight,
-            moe_weight=moe_weight,
-            supcon_weight=supcon_weight,
-            unsupcon_weight=unsupcon_weight,
-            sim_margin=sim_margin,
-            moe_balance_weight=moe_balance_weight,
-            token_reg_weight=token_reg_weight,
-            hypergraph_reg_weight=hypergraph_reg_weight,
-            acc5_loss_weight=acc5_loss_weight,
-            acc7_loss_weight=acc7_loss_weight,
-        )
+    for batch in dataloader:
+        text = batch["text"].to(device, non_blocking=True).float()
+        vision = batch["vision"].to(device, non_blocking=True).float()
+        audio = batch["audio"].to(device, non_blocking=True).float()
+        labels = batch["label"].to(device, non_blocking=True).float().view(-1)
+
+        with torch.amp.autocast(device_type=amp_device, enabled=use_amp):
+            preds, aux = model(text, vision, audio)
+            _, stats = total_loss(
+                preds,
+                labels,
+                aux,
+                sim_weight=sim_weight,
+                recon_weight=recon_weight,
+                moe_weight=moe_weight,
+                supcon_weight=supcon_weight,
+                unsupcon_weight=unsupcon_weight,
+                sim_margin=sim_margin,
+                moe_balance_weight=moe_balance_weight,
+                token_reg_weight=token_reg_weight,
+                hypergraph_reg_weight=hypergraph_reg_weight,
+                acc5_loss_weight=acc5_loss_weight,
+                acc7_loss_weight=acc7_loss_weight,
+            )
+
         batch_size = labels.size(0)
         total_samples += batch_size
 
@@ -567,8 +572,8 @@ def evaluate(
         ]:
             totals[key] += stats[key] * batch_size
 
-        all_preds.append(preds.detach().cpu())
-        all_labels.append(labels.detach().cpu())
+        all_preds.append(preds.detach().float().cpu())
+        all_labels.append(labels.detach().float().cpu())
 
     preds = torch.cat(all_preds)
     labels = torch.cat(all_labels)
@@ -621,6 +626,8 @@ def train_one_epoch(
     hypergraph_reg_weight: float = DEFAULT_HYPERGRAPH_REG_WEIGHT,
     acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
     acc7_loss_weight: float = DEFAULT_ACC7_LOSS_WEIGHT,
+    scaler: torch.amp.GradScaler | None = None,
+    use_amp: bool = False,
 ):
     model.train()
     total_samples = 0
@@ -643,33 +650,44 @@ def train_one_epoch(
         "token_peak_penalty": 0.0,
     }
 
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
+
     for batch in dataloader:
-        text = batch["text"].to(device).float()
-        vision = batch["vision"].to(device).float()
-        audio = batch["audio"].to(device).float()
-        labels = batch["label"].to(device).float().view(-1)
+        text = batch["text"].to(device, non_blocking=True).float()
+        vision = batch["vision"].to(device, non_blocking=True).float()
+        audio = batch["audio"].to(device, non_blocking=True).float()
+        labels = batch["label"].to(device, non_blocking=True).float().view(-1)
 
         optimizer.zero_grad(set_to_none=True)
-        preds, aux = model(text, vision, audio)
-        loss, stats = total_loss(
-            preds,
-            labels,
-            aux,
-            sim_weight=sim_weight,
-            recon_weight=recon_weight,
-            moe_weight=moe_weight,
-            supcon_weight=supcon_weight,
-            unsupcon_weight=unsupcon_weight,
-            sim_margin=sim_margin,
-            moe_balance_weight=moe_balance_weight,
-            token_reg_weight=token_reg_weight,
-            hypergraph_reg_weight=hypergraph_reg_weight,
-            acc5_loss_weight=acc5_loss_weight,
-            acc7_loss_weight=acc7_loss_weight,
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        with torch.amp.autocast(device_type=amp_device, enabled=use_amp):
+            preds, aux = model(text, vision, audio)
+            loss, stats = total_loss(
+                preds,
+                labels,
+                aux,
+                sim_weight=sim_weight,
+                recon_weight=recon_weight,
+                moe_weight=moe_weight,
+                supcon_weight=supcon_weight,
+                unsupcon_weight=unsupcon_weight,
+                sim_margin=sim_margin,
+                moe_balance_weight=moe_balance_weight,
+                token_reg_weight=token_reg_weight,
+                hypergraph_reg_weight=hypergraph_reg_weight,
+                acc5_loss_weight=acc5_loss_weight,
+                acc7_loss_weight=acc7_loss_weight,
+            )
+
+        if scaler is not None and use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
 
         batch_size = labels.size(0)
         total_samples += batch_size

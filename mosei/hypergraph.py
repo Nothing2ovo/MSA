@@ -9,21 +9,14 @@ class PaperBatchHypergraphBuilder(nn.Module):
     """
     Unified multimodal hypergraph builder on the shared branch.
 
-    Nodes:
-        shared_seq [B, 3, T, D] -> N = B * 3 * T nodes
-
-    Hyperedges:
-        1) tri-modal edge   : (t, v, a) at the same timestep
-        2) bi-modal edges   : (t, v), (t, a), (v, a) at the same timestep
-        3) intra-modal edge : each node + top-k same-modality neighbors in the batch
-
-    Difference from the previous version:
-        H is no longer binary. We keep a relaxed soft membership for each selected
-        hyperedge member so the shared space can preserve relative relationship
-        strength instead of collapsing to almost-uniform graph structure.
+    Speed-up changes:
+    1) keep the same tri-/bi-/intra-modal hyperedge design;
+    2) keep soft membership rather than reverting to hard binary H;
+    3) replace the previous Python-heavy per-edge writes with batched scatter/index_put.
     """
 
     CROSS_EDGE_TYPES = ("tva", "tv", "ta", "va")
+    PAIRS = ((0, 1), (0, 2), (1, 2))
 
     def __init__(self, intra_k: int = 3, soft_tau: float = 0.85):
         super().__init__()
@@ -31,74 +24,101 @@ class PaperBatchHypergraphBuilder(nn.Module):
         self.soft_tau = float(max(1e-4, soft_tau))
 
     @staticmethod
-    def _node_index(sample_idx: int, modality_idx: int, time_idx: int, seq_len: int) -> int:
-        return sample_idx * 3 * seq_len + modality_idx * seq_len + time_idx
-
-    @staticmethod
-    def _flat_to_bt(flat_idx: int, seq_len: int) -> Tuple[int, int]:
-        return flat_idx // seq_len, flat_idx % seq_len
+    def _flat_to_global_node(flat_idx: torch.Tensor, modality_idx: int, seq_len: int) -> torch.Tensor:
+        sample_idx = torch.div(flat_idx, seq_len, rounding_mode="floor")
+        time_idx = flat_idx - sample_idx * seq_len
+        return sample_idx * (3 * seq_len) + modality_idx * seq_len + time_idx
 
     def _soft_membership(self, scores: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(scores / self.soft_tau, dim=0)
+        return torch.softmax(scores / self.soft_tau, dim=-1)
+
+    def _build_cross_modal_edges(self, shared_norm: torch.Tensor, H: torch.Tensor) -> None:
+        batch_size, _, seq_len, feat_dim = shared_norm.shape
+        device = shared_norm.device
+        dtype = shared_norm.dtype
+        bt = batch_size * seq_len
+
+        # [B*T, 3, D]
+        nodes_bt = shared_norm.permute(0, 2, 1, 3).reshape(bt, 3, feat_dim)
+
+        bt_idx = torch.arange(bt, device=device)
+        sample_idx = torch.div(bt_idx, seq_len, rounding_mode="floor")
+        time_idx = bt_idx - sample_idx * seq_len
+        base = sample_idx * (3 * seq_len) + time_idx
+        node_idx_all = torch.stack(
+            [base + 0 * seq_len, base + 1 * seq_len, base + 2 * seq_len],
+            dim=1,
+        )  # [BT, 3]
+
+        # Tri-modal edges: edge ids [0, BT)
+        tri_center = F.normalize(nodes_bt.mean(dim=1), dim=-1)
+        tri_scores = torch.sum(nodes_bt * tri_center.unsqueeze(1), dim=-1)
+        tri_weights = self._soft_membership(tri_scores).to(dtype)
+        tri_edge_ids = bt_idx.unsqueeze(1).expand(-1, 3)
+        H.index_put_(
+            (node_idx_all.reshape(-1), tri_edge_ids.reshape(-1)),
+            tri_weights.reshape(-1),
+            accumulate=False,
+        )
+
+        # Bi-modal edges: tv, ta, va
+        for pair_offset, pair in enumerate(self.PAIRS, start=1):
+            pair_nodes = nodes_bt[:, list(pair), :]  # [BT, 2, D]
+            pair_center = F.normalize(pair_nodes.mean(dim=1), dim=-1)
+            pair_scores = torch.sum(pair_nodes * pair_center.unsqueeze(1), dim=-1)
+            pair_weights = self._soft_membership(pair_scores).to(dtype)
+            pair_node_idx = node_idx_all[:, list(pair)]
+            edge_ids = (pair_offset * bt + bt_idx).unsqueeze(1).expand(-1, 2)
+            H.index_put_(
+                (pair_node_idx.reshape(-1), edge_ids.reshape(-1)),
+                pair_weights.reshape(-1),
+                accumulate=False,
+            )
+
+    def _build_intra_modal_edges(self, shared_norm: torch.Tensor, H: torch.Tensor, cross_edges: int) -> None:
+        batch_size, num_modalities, seq_len, feat_dim = shared_norm.shape
+        device = shared_norm.device
+        dtype = shared_norm.dtype
+        bt = batch_size * seq_len
+        topk = min(self.intra_k, max(1, bt - 1))
+        flat_idx = torch.arange(bt, device=device)
+
+        for m in range(num_modalities):
+            feats = shared_norm[:, m, :, :].reshape(bt, feat_dim)
+            sim_raw = torch.matmul(feats, feats.t())
+            sim_for_topk = sim_raw.clone()
+            sim_for_topk.fill_diagonal_(-1e4)
+            nn_idx = torch.topk(sim_for_topk, k=topk, dim=-1).indices  # [BT, topk]
+
+            members = torch.cat([flat_idx.unsqueeze(1), nn_idx], dim=1)  # [BT, topk+1]
+            scores = sim_raw.gather(dim=1, index=members)
+            weights = self._soft_membership(scores).to(dtype)
+
+            global_member_idx = self._flat_to_global_node(members, modality_idx=m, seq_len=seq_len)
+            edge_ids = (cross_edges + m * bt + flat_idx).unsqueeze(1).expand_as(global_member_idx)
+            H.index_put_(
+                (global_member_idx.reshape(-1), edge_ids.reshape(-1)),
+                weights.reshape(-1),
+                accumulate=False,
+            )
 
     def forward(self, shared_seq: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        batch_size, num_modalities, seq_len, feat_dim = shared_seq.shape
+        batch_size, num_modalities, seq_len, _ = shared_seq.shape
         assert num_modalities == 3, "Only text/vision/audio are supported."
         device = shared_seq.device
         dtype = shared_seq.dtype
 
         shared_norm = F.normalize(shared_seq, dim=-1)
-
+        bt = batch_size * seq_len
         num_nodes = batch_size * num_modalities * seq_len
         num_cross_types = len(self.CROSS_EDGE_TYPES)
-        cross_edges = num_cross_types * batch_size * seq_len
-        intra_edges = batch_size * num_modalities * seq_len
+        cross_edges = num_cross_types * bt
+        intra_edges = num_modalities * bt
         num_edges = cross_edges + intra_edges
+
         H = torch.zeros(num_nodes, num_edges, device=device, dtype=dtype)
-
-        edge_id = 0
-        for b in range(batch_size):
-            for t in range(seq_len):
-                nodes = shared_norm[b, :, t, :]  # [3, D]
-
-                tri_idx = [
-                    self._node_index(b, 0, t, seq_len),
-                    self._node_index(b, 1, t, seq_len),
-                    self._node_index(b, 2, t, seq_len),
-                ]
-                tri_center = F.normalize(nodes.mean(dim=0, keepdim=True), dim=-1).squeeze(0)
-                tri_scores = torch.matmul(nodes, tri_center)
-                tri_weights = self._soft_membership(tri_scores)
-                H[torch.tensor(tri_idx, device=device), edge_id] = tri_weights.to(dtype)
-                edge_id += 1
-
-                for pair in ((0, 1), (0, 2), (1, 2)):
-                    pair_nodes = nodes[list(pair)]
-                    pair_idx = [self._node_index(b, m, t, seq_len) for m in pair]
-                    pair_center = F.normalize(pair_nodes.mean(dim=0, keepdim=True), dim=-1).squeeze(0)
-                    pair_scores = torch.matmul(pair_nodes, pair_center)
-                    pair_weights = self._soft_membership(pair_scores)
-                    H[torch.tensor(pair_idx, device=device), edge_id] = pair_weights.to(dtype)
-                    edge_id += 1
-
-        for m in range(num_modalities):
-            feats = shared_norm[:, m, :, :].reshape(batch_size * seq_len, feat_dim)
-            sim_raw = torch.matmul(feats, feats.t())
-            sim_for_topk = sim_raw.clone()
-            sim_for_topk.fill_diagonal_(-1e4)
-            topk = min(self.intra_k, max(1, batch_size * seq_len - 1))
-            nn_idx = torch.topk(sim_for_topk, k=topk, dim=-1).indices
-
-            for p in range(batch_size * seq_len):
-                eid = cross_edges + m * (batch_size * seq_len) + p
-                center_b, center_t = self._flat_to_bt(p, seq_len)
-                center_node = self._node_index(center_b, m, center_t, seq_len)
-                members = [p] + nn_idx[p].tolist()
-                scores = sim_raw[p, members]
-                weights = self._soft_membership(scores)
-                for w, q in zip(weights, members):
-                    nb_b, nb_t = self._flat_to_bt(q, seq_len)
-                    H[self._node_index(nb_b, m, nb_t, seq_len), eid] = w.to(dtype)
+        self._build_cross_modal_edges(shared_norm, H)
+        self._build_intra_modal_edges(shared_norm, H, cross_edges=cross_edges)
 
         aux = {
             "num_nodes": torch.tensor(float(num_nodes), device=device),
