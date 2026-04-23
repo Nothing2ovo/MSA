@@ -100,8 +100,8 @@ def labels_to_classes(labels: torch.Tensor) -> torch.Tensor:
 def _cross_modal_triplet(anchor: torch.Tensor, positive: torch.Tensor, labels: torch.Tensor, margin: float) -> torch.Tensor:
     batch_size = anchor.size(0)
     cls = labels_to_classes(labels)
-    anchor_n = F.normalize(anchor, dim=-1)
-    positive_n = F.normalize(positive, dim=-1)
+    anchor_n = F.normalize(anchor.float(), dim=-1)
+    positive_n = F.normalize(positive.float(), dim=-1)
     pos_sim = F.cosine_similarity(anchor_n, positive_n, dim=-1)
 
     sim_mat = torch.matmul(anchor_n, anchor_n.t())
@@ -109,7 +109,7 @@ def _cross_modal_triplet(anchor: torch.Tensor, positive: torch.Tensor, labels: t
     valid_mask = diff_mask & (~torch.eye(batch_size, device=anchor.device, dtype=torch.bool))
     masked = sim_mat.masked_fill(~valid_mask, -1e4)
     hardest_neg = masked.max(dim=1).values
-    no_neg = hardest_neg < -1e3
+    no_neg = ~valid_mask.any(dim=1)
     hardest_neg = torch.where(no_neg, torch.zeros_like(hardest_neg), hardest_neg)
     loss = F.relu(margin + hardest_neg - pos_sim)
     return loss.mean()
@@ -159,7 +159,7 @@ def supervised_hypergraph_contrastive_loss(
     labels: torch.Tensor,
     temperature: float = DEFAULT_SUPCON_TEMPERATURE,
 ) -> torch.Tensor:
-    z = F.normalize(aux["shared_proj"], dim=-1)
+    z = F.normalize(aux["shared_proj"].float(), dim=-1)
     cls = labels_to_classes(labels)
     batch_size = z.size(0)
     if batch_size <= 1:
@@ -167,7 +167,8 @@ def supervised_hypergraph_contrastive_loss(
 
     sim = torch.matmul(z, z.t()) / max(temperature, 1e-6)
     logits_mask = ~torch.eye(batch_size, device=z.device, dtype=torch.bool)
-    sim = sim.masked_fill(~logits_mask, -1e9)
+    mask_value = torch.finfo(sim.dtype).min
+    sim = sim.masked_fill(~logits_mask, mask_value)
 
     positive_mask = (cls.unsqueeze(1) == cls.unsqueeze(0)) & logits_mask
     log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
@@ -185,8 +186,8 @@ def unsupervised_hypergraph_contrastive_loss(
     aux: Dict[str, torch.Tensor],
     temperature: float = DEFAULT_UNSUPCON_TEMPERATURE,
 ) -> torch.Tensor:
-    z1 = F.normalize(aux["shared_proj"], dim=-1)
-    z2 = F.normalize(aux["shared_proj_aug"], dim=-1)
+    z1 = F.normalize(aux["shared_proj"].float(), dim=-1)
+    z2 = F.normalize(aux["shared_proj_aug"].float(), dim=-1)
     batch_size = z1.size(0)
     if batch_size <= 1:
         return 1.0 - F.cosine_similarity(z1, z2, dim=-1).mean()
@@ -194,7 +195,8 @@ def unsupervised_hypergraph_contrastive_loss(
     z = torch.cat([z1, z2], dim=0)
     sim = torch.matmul(z, z.t()) / max(temperature, 1e-6)
     logits_mask = ~torch.eye(2 * batch_size, device=z.device, dtype=torch.bool)
-    sim = sim.masked_fill(~logits_mask, -1e9)
+    mask_value = torch.finfo(sim.dtype).min
+    sim = sim.masked_fill(~logits_mask, mask_value)
 
     pos_idx = torch.arange(2 * batch_size, device=z.device)
     pos_idx = (pos_idx + batch_size) % (2 * batch_size)
