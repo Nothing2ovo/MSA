@@ -108,19 +108,21 @@ class SparseTMoE(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         gate_input, gate_attn = self.gate_pool(x)
-        # Keep gating in float32 under AMP/DataParallel to avoid half-precision
-        # overflow from very negative mask values during sparse top-k routing.
-        gate_logits = self.gate(gate_input).float()
-        top_vals, top_idx = torch.topk(gate_logits, k=self.top_k, dim=-1)
-        mask_value = torch.finfo(gate_logits.dtype).min
-        sparse_logits = torch.full_like(gate_logits, fill_value=mask_value)
+        gate_logits = self.gate(gate_input)
+
+        # AMP/DataParallel-safe routing: compute sparse softmax in float32 and
+        # avoid half overflow from extremely negative fill values.
+        gate_logits_fp32 = gate_logits.float()
+        top_vals, top_idx = torch.topk(gate_logits_fp32, k=self.top_k, dim=-1)
+        neg_large = torch.finfo(gate_logits_fp32.dtype).min
+        sparse_logits = torch.full_like(gate_logits_fp32, fill_value=neg_large)
         sparse_logits.scatter_(1, top_idx, top_vals)
         gate_probs = torch.softmax(sparse_logits, dim=-1)
-        gate_mask = torch.zeros_like(gate_logits)
+        gate_mask = torch.zeros_like(gate_logits_fp32)
         gate_mask.scatter_(1, top_idx, 1.0)
 
         expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
-        mixed = torch.sum(gate_probs.to(dtype=expert_outputs.dtype).unsqueeze(-1) * expert_outputs, dim=1)
+        mixed = torch.sum(gate_probs.to(expert_outputs.dtype).unsqueeze(-1) * expert_outputs, dim=1)
         mixed = self.norm(mixed)
 
         importance = gate_probs.mean(dim=0)

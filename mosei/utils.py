@@ -23,6 +23,38 @@ DEFAULT_SUPCON_TEMPERATURE = 0.20
 DEFAULT_UNSUPCON_TEMPERATURE = 0.20
 
 
+def _safe_neg_fill_value(x: torch.Tensor) -> float:
+    if not x.is_floating_point():
+        return -1e4
+    info = torch.finfo(x.dtype)
+    # use a large finite negative instead of raw min to keep logsumexp stable
+    return max(info.min, -1e4)
+
+
+def _as_float_tensor(x: torch.Tensor) -> torch.Tensor:
+    return x.float() if isinstance(x, torch.Tensor) else torch.as_tensor(x, dtype=torch.float32)
+
+
+def _dp_reduce_scalar(x) -> float:
+    if isinstance(x, torch.Tensor):
+        return float(x.float().mean().item())
+    return float(x)
+
+
+def _dp_reduce_lastdim_series(x: torch.Tensor) -> torch.Tensor:
+    x = _as_float_tensor(x)
+    while x.dim() > 1:
+        x = x.mean(dim=0)
+    return x
+
+
+def _dp_reduce_matrix_lastdim(x: torch.Tensor) -> torch.Tensor:
+    x = _as_float_tensor(x)
+    if x.dim() == 1:
+        return x.unsqueeze(0)
+    return x.reshape(-1, x.shape[-1])
+
+
 def compute_mae(preds: torch.Tensor, labels: torch.Tensor) -> float:
     return torch.mean(torch.abs(preds.view(-1) - labels.view(-1))).item()
 
@@ -100,8 +132,8 @@ def labels_to_classes(labels: torch.Tensor) -> torch.Tensor:
 def _cross_modal_triplet(anchor: torch.Tensor, positive: torch.Tensor, labels: torch.Tensor, margin: float) -> torch.Tensor:
     batch_size = anchor.size(0)
     cls = labels_to_classes(labels)
-    anchor_n = F.normalize(anchor.float(), dim=-1)
-    positive_n = F.normalize(positive.float(), dim=-1)
+    anchor_n = F.normalize(anchor, dim=-1)
+    positive_n = F.normalize(positive, dim=-1)
     pos_sim = F.cosine_similarity(anchor_n, positive_n, dim=-1)
 
     sim_mat = torch.matmul(anchor_n, anchor_n.t())
@@ -109,7 +141,7 @@ def _cross_modal_triplet(anchor: torch.Tensor, positive: torch.Tensor, labels: t
     valid_mask = diff_mask & (~torch.eye(batch_size, device=anchor.device, dtype=torch.bool))
     masked = sim_mat.masked_fill(~valid_mask, -1e4)
     hardest_neg = masked.max(dim=1).values
-    no_neg = ~valid_mask.any(dim=1)
+    no_neg = hardest_neg < -1e3
     hardest_neg = torch.where(no_neg, torch.zeros_like(hardest_neg), hardest_neg)
     loss = F.relu(margin + hardest_neg - pos_sim)
     return loss.mean()
@@ -167,8 +199,7 @@ def supervised_hypergraph_contrastive_loss(
 
     sim = torch.matmul(z, z.t()) / max(temperature, 1e-6)
     logits_mask = ~torch.eye(batch_size, device=z.device, dtype=torch.bool)
-    mask_value = torch.finfo(sim.dtype).min
-    sim = sim.masked_fill(~logits_mask, mask_value)
+    sim = sim.masked_fill(~logits_mask, _safe_neg_fill_value(sim))
 
     positive_mask = (cls.unsqueeze(1) == cls.unsqueeze(0)) & logits_mask
     log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
@@ -195,8 +226,7 @@ def unsupervised_hypergraph_contrastive_loss(
     z = torch.cat([z1, z2], dim=0)
     sim = torch.matmul(z, z.t()) / max(temperature, 1e-6)
     logits_mask = ~torch.eye(2 * batch_size, device=z.device, dtype=torch.bool)
-    mask_value = torch.finfo(sim.dtype).min
-    sim = sim.masked_fill(~logits_mask, mask_value)
+    sim = sim.masked_fill(~logits_mask, _safe_neg_fill_value(sim))
 
     pos_idx = torch.arange(2 * batch_size, device=z.device)
     pos_idx = (pos_idx + batch_size) % (2 * batch_size)
@@ -215,11 +245,11 @@ def hypergraph_structure_loss(
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     hyper_aux = aux["hyper_aux"]
 
-    per_layer_edge_std = hyper_aux["per_layer_edge_weight_std"]
-    per_layer_cross_std = hyper_aux["per_layer_cross_edge_weight_std"]
-    per_layer_intra_std = hyper_aux["per_layer_intra_edge_weight_std"]
-    per_layer_gap = hyper_aux["per_layer_cross_intra_gap"].abs()
-    per_layer_spread = hyper_aux["per_layer_edge_spread"]
+    per_layer_edge_std = _dp_reduce_lastdim_series(hyper_aux["per_layer_edge_weight_std"])
+    per_layer_cross_std = _dp_reduce_lastdim_series(hyper_aux["per_layer_cross_edge_weight_std"])
+    per_layer_intra_std = _dp_reduce_lastdim_series(hyper_aux["per_layer_intra_edge_weight_std"])
+    per_layer_gap = _dp_reduce_lastdim_series(hyper_aux["per_layer_cross_intra_gap"].abs())
+    per_layer_spread = _dp_reduce_lastdim_series(hyper_aux["per_layer_edge_spread"])
 
     num_layers = int(per_layer_edge_std.numel())
     layer_weights = torch.linspace(
@@ -397,24 +427,45 @@ def total_loss(
     fusion_attn = aux["fusion_attn"]
     if fusion_attn.dim() == 4:
         fusion_attn = fusion_attn.mean(dim=1)
+    fusion_attn = _dp_reduce_matrix_lastdim(fusion_attn.reshape(-1, fusion_attn.shape[-2], fusion_attn.shape[-1])).reshape(-1, fusion_attn.shape[-2], fusion_attn.shape[-1])
     hyper_aux = aux["hyper_aux"]
+    node_attn = _dp_reduce_matrix_lastdim(hyper_aux["node_attn"])
+    token_weights = _dp_reduce_matrix_lastdim(token_weights)
+    gate_t_probs = _as_float_tensor(aux["tmoe_t_aux"]["gate_probs"])
+    gate_v_probs = _as_float_tensor(aux["tmoe_v_aux"]["gate_probs"])
+    gate_a_probs = _as_float_tensor(aux["tmoe_a_aux"]["gate_probs"])
+    if gate_t_probs.dim() > 2:
+        gate_t_probs = gate_t_probs.reshape(-1, gate_t_probs.shape[-1])
+    if gate_v_probs.dim() > 2:
+        gate_v_probs = gate_v_probs.reshape(-1, gate_v_probs.shape[-1])
+    if gate_a_probs.dim() > 2:
+        gate_a_probs = gate_a_probs.reshape(-1, gate_a_probs.shape[-1])
+    hyper_repr = _as_float_tensor(aux["hyper_repr"])
+    hyper_repr_aug = _as_float_tensor(aux["hyper_repr_aug"])
+    if hyper_repr.dim() > 2:
+        hyper_repr = hyper_repr.reshape(-1, hyper_repr.shape[-1])
+    if hyper_repr_aug.dim() > 2:
+        hyper_repr_aug = hyper_repr_aug.reshape(-1, hyper_repr_aug.shape[-1])
+    fused_repr = _as_float_tensor(aux["fused_repr"])
+    if fused_repr.dim() > 2:
+        fused_repr = fused_repr.reshape(-1, fused_repr.shape[-1])
 
     stats = {
-        "task_loss": float(l_task.item()),
-        "sim_loss": float(l_s.item()),
-        "recon_loss": float(l_r.item()),
-        "moe_loss": float(l_m.item()),
-        "supcon_loss": float(l_sup.item()),
-        "unsupcon_loss": float(l_unsup.item()),
+        "task_loss": _dp_reduce_scalar(l_task),
+        "sim_loss": _dp_reduce_scalar(l_s),
+        "recon_loss": _dp_reduce_scalar(l_r),
+        "moe_loss": _dp_reduce_scalar(l_m),
+        "supcon_loss": _dp_reduce_scalar(l_sup),
+        "unsupcon_loss": _dp_reduce_scalar(l_unsup),
         "hypergraph_reg_loss": hg_stats["hypergraph_reg_loss"],
-        "acc5_loss": float(l_acc5.item()),
-        "acc7_loss": float(l_acc7.item()),
-        "total_loss": float(total.item()),
+        "acc5_loss": _dp_reduce_scalar(l_acc5),
+        "acc7_loss": _dp_reduce_scalar(l_acc7),
+        "total_loss": _dp_reduce_scalar(total),
         **token_stats,
-        "cross_edge_weight_mean": float(hyper_aux["cross_edge_weight_mean"].item()),
-        "intra_edge_weight_mean": float(hyper_aux["intra_edge_weight_mean"].item()),
-        "cross_edge_weight_std": float(hyper_aux["cross_edge_weight_std"].item()),
-        "intra_edge_weight_std": float(hyper_aux["intra_edge_weight_std"].item()),
+        "cross_edge_weight_mean": _dp_reduce_scalar(hyper_aux["cross_edge_weight_mean"]),
+        "intra_edge_weight_mean": _dp_reduce_scalar(hyper_aux["intra_edge_weight_mean"]),
+        "cross_edge_weight_std": _dp_reduce_scalar(hyper_aux["cross_edge_weight_std"]),
+        "intra_edge_weight_std": _dp_reduce_scalar(hyper_aux["intra_edge_weight_std"]),
         "edge_weight_std": hg_stats["edge_weight_std"],
         "cross_intra_gap": hg_stats["cross_intra_gap"],
         "edge_spread": hg_stats["edge_spread"],
@@ -423,23 +474,23 @@ def total_loss(
         "multi_layer_edge_spread": hg_stats["multi_layer_edge_spread"],
         "late_std_preserve_penalty": hg_stats["late_std_preserve_penalty"],
         "late_spread_preserve_penalty": hg_stats["late_spread_preserve_penalty"],
-        "node_attn_t": float(hyper_aux["node_attn"][:, 0].mean().item()),
-        "node_attn_v": float(hyper_aux["node_attn"][:, 1].mean().item()),
-        "node_attn_a": float(hyper_aux["node_attn"][:, 2].mean().item()),
-        "token_weight_shared": float(token_weights[:, 0].mean().item()),
-        "token_weight_text": float(token_weights[:, 1].mean().item()),
-        "token_weight_vision": float(token_weights[:, 2].mean().item()),
-        "token_weight_audio": float(token_weights[:, 3].mean().item()),
+        "node_attn_t": _dp_reduce_scalar(node_attn[:, 0].mean()),
+        "node_attn_v": _dp_reduce_scalar(node_attn[:, 1].mean()),
+        "node_attn_a": _dp_reduce_scalar(node_attn[:, 2].mean()),
+        "token_weight_shared": _dp_reduce_scalar(token_weights[:, 0].mean()),
+        "token_weight_text": _dp_reduce_scalar(token_weights[:, 1].mean()),
+        "token_weight_vision": _dp_reduce_scalar(token_weights[:, 2].mean()),
+        "token_weight_audio": _dp_reduce_scalar(token_weights[:, 3].mean()),
         "token_dominance_margin": token_stats["token_dominance_margin"],
-        "attn_shared_to_shared": float(fusion_attn[:, 0, 0].mean().item()),
-        "attn_shared_to_text": float(fusion_attn[:, 0, 1].mean().item()),
-        "attn_shared_to_vision": float(fusion_attn[:, 0, 2].mean().item()),
-        "attn_shared_to_audio": float(fusion_attn[:, 0, 3].mean().item()),
-        "gate_t_mean": float(aux["tmoe_t_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
-        "gate_v_mean": float(aux["tmoe_v_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
-        "gate_a_mean": float(aux["tmoe_a_aux"]["gate_probs"].max(dim=-1).values.mean().item()),
-        "shared_view_gap": float(torch.mean(torch.abs(aux["hyper_repr"] - aux["hyper_repr_aug"])).item()),
-        "fused_repr_norm": float(aux["fused_repr"].norm(dim=-1).mean().item()),
+        "attn_shared_to_shared": _dp_reduce_scalar(fusion_attn[:, 0, 0].mean()),
+        "attn_shared_to_text": _dp_reduce_scalar(fusion_attn[:, 0, 1].mean()),
+        "attn_shared_to_vision": _dp_reduce_scalar(fusion_attn[:, 0, 2].mean()),
+        "attn_shared_to_audio": _dp_reduce_scalar(fusion_attn[:, 0, 3].mean()),
+        "gate_t_mean": _dp_reduce_scalar(gate_t_probs.max(dim=-1).values.mean()),
+        "gate_v_mean": _dp_reduce_scalar(gate_v_probs.max(dim=-1).values.mean()),
+        "gate_a_mean": _dp_reduce_scalar(gate_a_probs.max(dim=-1).values.mean()),
+        "shared_view_gap": _dp_reduce_scalar(torch.mean(torch.abs(hyper_repr - hyper_repr_aug))),
+        "fused_repr_norm": _dp_reduce_scalar(fused_repr.norm(dim=-1).mean()),
     }
     return total, stats
 
