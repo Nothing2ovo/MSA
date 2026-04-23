@@ -353,6 +353,11 @@ class DHMModel(nn.Module):
            -> TMoEs on private branches
            -> 4-token fusion
            -> direct prediction
+
+    This revision keeps the shared space from becoming too flat by:
+    1) using shared = core + 0.2 * residual,
+    2) feeding the shared branch into a soft-membership hypergraph,
+    3) using an initial-state residual in hypergraph propagation.
     """
 
     def __init__(
@@ -372,17 +377,25 @@ class DHMModel(nn.Module):
         intra_k: int = 3,
         dropout: float = 0.5,
         shared_edge_drop: float = 0.30,
+        shared_residual_scale: float = 0.20,
+        hg_initial_residual_alpha: float = 0.25,
+        hg_soft_tau: float = 0.85,
     ):
         super().__init__()
         self.shared_edge_drop = float(shared_edge_drop)
+        self.shared_residual_scale = float(shared_residual_scale)
 
         self.text_conv = TemporalConvEncoder(text_dim, conv_hidden, kernel_size=3, dropout=dropout)
         self.vision_conv = TemporalConvEncoder(vision_dim, conv_hidden, kernel_size=3, dropout=dropout)
         self.audio_conv = TemporalConvEncoder(audio_dim, conv_hidden, kernel_size=3, dropout=dropout)
 
-        self.shared_t = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
-        self.shared_v = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
-        self.shared_a = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
+        self.shared_core_t = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
+        self.shared_core_v = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
+        self.shared_core_a = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
+
+        self.shared_res_t = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
+        self.shared_res_v = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
+        self.shared_res_a = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
 
         self.private_t = SequenceMLPEncoder(conv_hidden, private_dim, dropout=dropout)
         self.private_v = SequenceMLPEncoder(conv_hidden, private_dim, dropout=dropout)
@@ -400,6 +413,8 @@ class DHMModel(nn.Module):
             dropout=dropout,
             max_batch_size=32,
             max_seq_len=64,
+            soft_tau=hg_soft_tau,
+            initial_residual_alpha=hg_initial_residual_alpha,
         )
         self.shared_proj_head = nn.Sequential(
             nn.Linear(hyper_hidden, hyper_hidden),
@@ -422,14 +437,21 @@ class DHMModel(nn.Module):
         self.fusion_norm = nn.LayerNorm(fusion_dim)
         self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
 
+    def _build_shared(self, c: torch.Tensor, core_encoder: nn.Module, residual_encoder: nn.Module) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        core = core_encoder(c)
+        residual = residual_encoder(c)
+        shared = core + self.shared_residual_scale * residual
+        return shared, core, residual
+
     def forward(self, text: torch.Tensor, vision: torch.Tensor, audio: torch.Tensor):
         c_t = self.text_conv(text)
         c_v = self.vision_conv(vision)
         c_a = self.audio_conv(audio)
 
-        e_irr_t = self.shared_t(c_t)
-        e_irr_v = self.shared_v(c_v)
-        e_irr_a = self.shared_a(c_a)
+        e_irr_t, e_irr_core_t, e_irr_res_t = self._build_shared(c_t, self.shared_core_t, self.shared_res_t)
+        e_irr_v, e_irr_core_v, e_irr_res_v = self._build_shared(c_v, self.shared_core_v, self.shared_res_v)
+        e_irr_a, e_irr_core_a, e_irr_res_a = self._build_shared(c_a, self.shared_core_a, self.shared_res_a)
+
         e_spe_t = self.private_t(c_t)
         e_spe_v = self.private_v(c_v)
         e_spe_a = self.private_a(c_a)
@@ -440,8 +462,6 @@ class DHMModel(nn.Module):
 
         shared_sequences = torch.stack([e_irr_t, e_irr_v, e_irr_a], dim=1)
         hyper_repr, hyper_aux = self.hypergraph(shared_sequences, edge_drop_rate=0.0, deterministic_drop=False)
-
-        # second view for shared-hypergraph unsupervised contrastive learning
         hyper_repr_aug, hyper_aux_aug = self.hypergraph(
             shared_sequences,
             edge_drop_rate=self.shared_edge_drop,
@@ -468,6 +488,12 @@ class DHMModel(nn.Module):
             "e_irr_t": e_irr_t,
             "e_irr_v": e_irr_v,
             "e_irr_a": e_irr_a,
+            "e_irr_core_t": e_irr_core_t,
+            "e_irr_core_v": e_irr_core_v,
+            "e_irr_core_a": e_irr_core_a,
+            "e_irr_res_t": e_irr_res_t,
+            "e_irr_res_v": e_irr_res_v,
+            "e_irr_res_a": e_irr_res_a,
             "e_spe_t": e_spe_t,
             "e_spe_v": e_spe_v,
             "e_spe_a": e_spe_a,

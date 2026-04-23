@@ -143,7 +143,7 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
     analysis = metrics["analysis"]
     lines = [
         f"[{timestamp}]",
-        "========== Final Test (decoupled shared hypergraph + shared CL + TMoEs + 4-token direct prediction) ==========",
+        "========== Final Test (shared-residual decoupling + soft-H hypergraph + x0-residual HG + TMoEs + 4-token direct prediction) ==========",
         f"Test total loss: {metrics['total_loss']:.4f}",
         f"Test task loss : {metrics['task_loss']:.4f}",
         f"Test sim loss  : {metrics['sim_loss']:.4f}",
@@ -247,11 +247,11 @@ def main() -> None:
     patience = 10
     grad_clip = 1.0
 
-    sim_weight = 0.05
+    sim_weight = 0.02
     recon_weight = 0.05
     moe_weight = 0.10
-    supcon_weight = 0.05
-    unsupcon_weight = 0.05
+    supcon_weight = 0.02
+    unsupcon_weight = 0.01
     sim_margin = 0.20
 
     token_reg_weight = 0.04
@@ -272,7 +272,7 @@ def main() -> None:
     intra_k = 3
     shared_edge_drop = 0.30
 
-    print("[Config] decoupled shared-hypergraph / shared CL / TMoEs / 4-token direct prediction")
+    print("[Config] shared-residual decoupling / soft-H hypergraph / x0-residual HG / TMoEs / 4-token direct prediction")
     print(
         f"[Config] sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
@@ -309,6 +309,9 @@ def main() -> None:
         intra_k=intra_k,
         dropout=dropout,
         shared_edge_drop=shared_edge_drop,
+        shared_residual_scale=0.20,
+        hg_initial_residual_alpha=0.25,
+        hg_soft_tau=0.85,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)

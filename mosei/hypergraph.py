@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 class PaperBatchHypergraphBuilder(nn.Module):
     """
-    Shared-branch unified multimodal hypergraph builder.
+    Unified multimodal hypergraph builder on the shared branch.
 
     Nodes:
         shared_seq [B, 3, T, D] -> N = B * 3 * T nodes
@@ -16,13 +16,19 @@ class PaperBatchHypergraphBuilder(nn.Module):
         1) tri-modal edge   : (t, v, a) at the same timestep
         2) bi-modal edges   : (t, v), (t, a), (v, a) at the same timestep
         3) intra-modal edge : each node + top-k same-modality neighbors in the batch
+
+    Difference from the previous version:
+        H is no longer binary. We keep a relaxed soft membership for each selected
+        hyperedge member so the shared space can preserve relative relationship
+        strength instead of collapsing to almost-uniform graph structure.
     """
 
     CROSS_EDGE_TYPES = ("tva", "tv", "ta", "va")
 
-    def __init__(self, intra_k: int = 3):
+    def __init__(self, intra_k: int = 3, soft_tau: float = 0.85):
         super().__init__()
         self.intra_k = int(intra_k)
+        self.soft_tau = float(max(1e-4, soft_tau))
 
     @staticmethod
     def _node_index(sample_idx: int, modality_idx: int, time_idx: int, seq_len: int) -> int:
@@ -32,51 +38,67 @@ class PaperBatchHypergraphBuilder(nn.Module):
     def _flat_to_bt(flat_idx: int, seq_len: int) -> Tuple[int, int]:
         return flat_idx // seq_len, flat_idx % seq_len
 
+    def _soft_membership(self, scores: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(scores / self.soft_tau, dim=0)
+
     def forward(self, shared_seq: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size, num_modalities, seq_len, feat_dim = shared_seq.shape
         assert num_modalities == 3, "Only text/vision/audio are supported."
         device = shared_seq.device
         dtype = shared_seq.dtype
 
+        shared_norm = F.normalize(shared_seq, dim=-1)
+
         num_nodes = batch_size * num_modalities * seq_len
         num_cross_types = len(self.CROSS_EDGE_TYPES)
         cross_edges = num_cross_types * batch_size * seq_len
         intra_edges = batch_size * num_modalities * seq_len
         num_edges = cross_edges + intra_edges
-
         H = torch.zeros(num_nodes, num_edges, device=device, dtype=dtype)
 
-        # cross-modal hyperedges: tri-modal + three bi-modal pairs
         edge_id = 0
         for b in range(batch_size):
             for t in range(seq_len):
-                # tri-modal: text / vision / audio
-                for m in (0, 1, 2):
-                    H[self._node_index(b, m, t, seq_len), edge_id] = 1.0
+                nodes = shared_norm[b, :, t, :]  # [3, D]
+
+                tri_idx = [
+                    self._node_index(b, 0, t, seq_len),
+                    self._node_index(b, 1, t, seq_len),
+                    self._node_index(b, 2, t, seq_len),
+                ]
+                tri_center = F.normalize(nodes.mean(dim=0, keepdim=True), dim=-1).squeeze(0)
+                tri_scores = torch.matmul(nodes, tri_center)
+                tri_weights = self._soft_membership(tri_scores)
+                H[torch.tensor(tri_idx, device=device), edge_id] = tri_weights.to(dtype)
                 edge_id += 1
 
-                # bi-modal: tv / ta / va
                 for pair in ((0, 1), (0, 2), (1, 2)):
-                    for m in pair:
-                        H[self._node_index(b, m, t, seq_len), edge_id] = 1.0
+                    pair_nodes = nodes[list(pair)]
+                    pair_idx = [self._node_index(b, m, t, seq_len) for m in pair]
+                    pair_center = F.normalize(pair_nodes.mean(dim=0, keepdim=True), dim=-1).squeeze(0)
+                    pair_scores = torch.matmul(pair_nodes, pair_center)
+                    pair_weights = self._soft_membership(pair_scores)
+                    H[torch.tensor(pair_idx, device=device), edge_id] = pair_weights.to(dtype)
                     edge_id += 1
 
-        # intra-modal hyperedges: batch-wise top-k same-modality neighbors
         for m in range(num_modalities):
-            feats = shared_seq[:, m, :, :].reshape(batch_size * seq_len, feat_dim)
-            feats = F.normalize(feats, dim=-1)
-            sim = torch.matmul(feats, feats.t())
-            sim.fill_diagonal_(-1e4)
+            feats = shared_norm[:, m, :, :].reshape(batch_size * seq_len, feat_dim)
+            sim_raw = torch.matmul(feats, feats.t())
+            sim_for_topk = sim_raw.clone()
+            sim_for_topk.fill_diagonal_(-1e4)
             topk = min(self.intra_k, max(1, batch_size * seq_len - 1))
-            nn_idx = torch.topk(sim, k=topk, dim=-1).indices
+            nn_idx = torch.topk(sim_for_topk, k=topk, dim=-1).indices
 
             for p in range(batch_size * seq_len):
                 eid = cross_edges + m * (batch_size * seq_len) + p
                 center_b, center_t = self._flat_to_bt(p, seq_len)
-                H[self._node_index(center_b, m, center_t, seq_len), eid] = 1.0
-                for q in nn_idx[p].tolist():
+                center_node = self._node_index(center_b, m, center_t, seq_len)
+                members = [p] + nn_idx[p].tolist()
+                scores = sim_raw[p, members]
+                weights = self._soft_membership(scores)
+                for w, q in zip(weights, members):
                     nb_b, nb_t = self._flat_to_bt(q, seq_len)
-                    H[self._node_index(nb_b, m, nb_t, seq_len), eid] = 1.0
+                    H[self._node_index(nb_b, m, nb_t, seq_len), eid] = w.to(dtype)
 
         aux = {
             "num_nodes": torch.tensor(float(num_nodes), device=device),
@@ -86,6 +108,7 @@ class PaperBatchHypergraphBuilder(nn.Module):
             "num_cross_types": torch.tensor(float(num_cross_types), device=device),
             "batch_size": torch.tensor(float(batch_size), device=device),
             "seq_len": torch.tensor(float(seq_len), device=device),
+            "soft_tau": torch.tensor(float(self.soft_tau), device=device),
         }
         return H, aux
 
@@ -164,7 +187,7 @@ class AntiCollapseHypergraphConv(nn.Module):
         seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         Ht = H.transpose(0, 1)
-        de = H.sum(dim=0).clamp_min(1.0)
+        de = H.sum(dim=0).clamp_min(1e-6)
         num_cross = self.num_cross_types * batch_size * seq_len
 
         edge_repr = torch.matmul(Ht, x) / de.unsqueeze(-1)
@@ -205,10 +228,13 @@ class HypergraphEncoder(nn.Module):
         dropout: float = 0.1,
         max_batch_size: int = 32,
         max_seq_len: int = 64,
+        soft_tau: float = 0.85,
+        initial_residual_alpha: float = 0.25,
     ):
         super().__init__()
         self.num_cross_types = 4
-        self.builder = PaperBatchHypergraphBuilder(intra_k=intra_k)
+        self.initial_residual_alpha = float(initial_residual_alpha)
+        self.builder = PaperBatchHypergraphBuilder(intra_k=intra_k, soft_tau=soft_tau)
         self.input_proj = nn.Sequential(
             nn.Linear(node_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -319,7 +345,8 @@ class HypergraphEncoder(nn.Module):
         batch_size, _, seq_len, _ = shared_seq.shape
         H, graph_meta = self.builder(shared_seq)
         H_used, edge_keep_mask = self._drop_hyperedges(H, edge_drop_rate, deterministic=deterministic_drop)
-        x = self.input_proj(shared_seq.reshape(batch_size * 3 * seq_len, -1))
+        x0 = self.input_proj(shared_seq.reshape(batch_size * 3 * seq_len, -1))
+        x = x0
 
         edge_weights_per_layer: List[torch.Tensor] = []
         edge_repr_per_layer: List[torch.Tensor] = []
@@ -333,7 +360,8 @@ class HypergraphEncoder(nn.Module):
 
         num_cross = self.num_cross_types * batch_size * seq_len
         for layer in self.layers:
-            x, edge_w, edge_repr = layer(x, H_used, batch_size=batch_size, seq_len=seq_len)
+            layer_out, edge_w, edge_repr = layer(x, H_used, batch_size=batch_size, seq_len=seq_len)
+            x = self.initial_residual_alpha * x0 + (1.0 - self.initial_residual_alpha) * layer_out
             edge_weights_per_layer.append(edge_w)
             edge_repr_per_layer.append(edge_repr)
             stats = self._compute_edge_stats(edge_w, num_cross)
@@ -389,6 +417,7 @@ class HypergraphEncoder(nn.Module):
             "node_summary": node_summary,
             "edge_summary": edge_summary,
             "node_edge_gate": gate,
+            "x0": x0,
             "edge_weights_per_layer": edge_weights_per_layer,
             "edge_repr_per_layer": edge_repr_per_layer,
             "per_layer_cross_edge_weight_mean": per_layer_cross_means,
