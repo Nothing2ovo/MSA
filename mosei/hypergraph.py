@@ -106,9 +106,11 @@ class PaperBatchHypergraphBuilder(nn.Module):
         batch_size, num_modalities, seq_len, _ = shared_seq.shape
         assert num_modalities == 3, "Only text/vision/audio are supported."
         device = shared_seq.device
-        dtype = shared_seq.dtype
+        dtype = torch.float32
 
-        shared_norm = F.normalize(shared_seq, dim=-1)
+        # Build H in float32 regardless of AMP state so index_put_/scatter writes
+        # never see Half destination vs Float source mismatches under DataParallel.
+        shared_norm = F.normalize(shared_seq.float(), dim=-1)
         bt = batch_size * seq_len
         num_nodes = batch_size * num_modalities * seq_len
         num_cross_types = len(self.CROSS_EDGE_TYPES)
@@ -364,8 +366,11 @@ class HypergraphEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size, _, seq_len, _ = shared_seq.shape
         H, graph_meta = self.builder(shared_seq)
-        H_used, edge_keep_mask = self._drop_hyperedges(H, edge_drop_rate, deterministic=deterministic_drop)
         x0 = self.input_proj(shared_seq.reshape(batch_size * 3 * seq_len, -1))
+        # Cast the incidence matrix only after construction so builder stays AMP-safe
+        # while propagation matches the activation dtype used by the current device.
+        H = H.to(device=x0.device, dtype=x0.dtype)
+        H_used, edge_keep_mask = self._drop_hyperedges(H, edge_drop_rate, deterministic=deterministic_drop)
         x = x0
 
         edge_weights_per_layer: List[torch.Tensor] = []

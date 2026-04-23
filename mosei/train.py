@@ -79,38 +79,37 @@ def maybe_wrap_dataparallel(model: torch.nn.Module, device: torch.device) -> tup
 
 
 def model_selection_score(metrics: Dict[str, float]) -> float:
-    cls_reward = (
-        1.80 * metrics["Acc5"]
-        + 1.20 * metrics["Acc7"]
-        + 0.35 * metrics["Acc2_posneg"]
-        + 0.20 * metrics["F1_posneg"]
-        + 0.08 * metrics["Corr"]
-        - 0.03 * metrics["MAE"]
-    )
-    return -cls_reward
+    """
+    Regression-oriented plateau score. Smaller is better.
+    Primary objective: lower MAE
+    Secondary objective: higher Corr
+    """
+    return float(metrics["MAE"]) - 0.10 * float(metrics["Corr"])
 
 
-def classification_priority_tuple(metrics: Dict[str, float]) -> tuple:
+def regression_priority_tuple(metrics: Dict[str, float]) -> tuple:
+    """
+    Larger tuple is better. Order: -MAE > Corr
+    """
     return (
-        round(float(metrics["Acc5"]), 6),
-        round(float(metrics["Acc7"]), 6),
-        round(float(metrics["Acc2_posneg"]), 6),
-        round(float(metrics["F1_posneg"]), 6),
-        round(float(metrics["Corr"]), 6),
         round(float(-metrics["MAE"]), 6),
+        round(float(metrics["Corr"]), 6),
     )
 
 
 def is_better_checkpoint(current: Dict[str, float], best: Dict[str, float] | None) -> bool:
     if best is None:
         return True
-    acc5_gap = float(current["Acc5"] - best["Acc5"])
-    acc7_gap = float(current["Acc7"] - best["Acc7"])
-    if acc5_gap >= 0.0020:
+
+    mae_gap = float(best["MAE"] - current["MAE"])
+    corr_gap = float(current["Corr"] - best["Corr"])
+
+    if mae_gap >= 0.0010:
         return True
-    if acc7_gap >= 0.0020 and acc5_gap >= -0.0010:
+    if abs(float(current["MAE"] - best["MAE"])) <= 0.0010 and corr_gap >= 0.0010:
         return True
-    return classification_priority_tuple(current) > classification_priority_tuple(best)
+
+    return regression_priority_tuple(current) > regression_priority_tuple(best)
 
 
 def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) -> None:
@@ -265,7 +264,7 @@ def print_epoch_summary(
     )
     print(f"  selection score = {score:.4f}")
     if improved:
-        print("  status          = improved, cls-priority best model saved")
+        print("  status          = improved, regression-priority best model saved")
     else:
         print(f"  status          = no improvement, early stop counter {wait}/{patience}")
 
@@ -318,7 +317,7 @@ def main() -> None:
         f"[Config] sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
         f"token_reg={token_reg_weight:.3f} hyper_reg={hypergraph_reg_weight:.3f} "
-        f"edge_drop={shared_edge_drop:.2f} | ckpt=Acc5>Acc7>Acc2>F1"
+        f"edge_drop={shared_edge_drop:.2f} | ckpt=MAE>Corr"
     )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -368,7 +367,7 @@ def main() -> None:
 
     best_score = float("inf")
     best_mae_ref = float("inf")
-    best_cls_metrics = None
+    best_reg_metrics = None
     wait = 0
 
     history = {
@@ -456,15 +455,11 @@ def main() -> None:
         history["token_entropy"].append(valid_metrics["token_entropy"])
         history["token_max_weight"].append(valid_metrics["token_max_weight"])
 
-        improved = is_better_checkpoint(valid_metrics, best_cls_metrics)
+        improved = is_better_checkpoint(valid_metrics, best_reg_metrics)
         if improved:
-            best_cls_metrics = {
-                "Acc5": float(valid_metrics["Acc5"]),
-                "Acc7": float(valid_metrics["Acc7"]),
-                "Acc2_posneg": float(valid_metrics["Acc2_posneg"]),
-                "F1_posneg": float(valid_metrics["F1_posneg"]),
-                "Corr": float(valid_metrics["Corr"]),
+            best_reg_metrics = {
                 "MAE": float(valid_metrics["MAE"]),
+                "Corr": float(valid_metrics["Corr"]),
             }
             best_score = score
             wait = 0
@@ -492,7 +487,7 @@ def main() -> None:
             print("early stopping triggered")
             break
 
-    print("\nloading best 4-token direct-pred model...")
+    print("\nloading best regression-priority model...")
     unwrap_model(model).load_state_dict(torch.load(BEST_MODEL_FILE, map_location=device))
     final_valid = evaluate(
         model, valid_loader, device,
