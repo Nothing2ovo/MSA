@@ -430,8 +430,6 @@ class HypergraphEncoder(nn.Module):
         per_layer_spreads = torch.stack(layer_spreads)
 
         aux = {
-            "incidence_matrix": H_used,
-            "raw_incidence_matrix": H,
             "edge_keep_mask": edge_keep_mask,
             "node_output": node_out,
             "modality_output": modality_repr,
