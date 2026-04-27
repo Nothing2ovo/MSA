@@ -281,7 +281,7 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    batch_size = 16
+    batch_size = 32
     num_epochs = 50
     learning_rate = 1e-4
     weight_decay = 1e-4
@@ -305,12 +305,12 @@ def main() -> None:
     conv_hidden = 128
     shared_dim = 64
     private_dim = 64
-    shared_mixer_hidden = 96
+    shared_mixer_hidden = 64
     fusion_dim = 128
     num_experts = 3
     top_k = 1
     num_heads = 4
-    mixer_layers = 2
+    mixer_layers = 1
     mamba_state_dim = 16
     shared_drop_rate = 0.15
 
@@ -359,7 +359,7 @@ def main() -> None:
         dropout=dropout,
         shared_drop_rate=shared_drop_rate,
         shared_residual_scale=0.20,
-        use_shared_cross_attention=True,
+        use_shared_cross_attention=False,
         require_official_mamba=True,
     ).to(device)
     model, parallel_mode = maybe_wrap_dataparallel(model, device)
