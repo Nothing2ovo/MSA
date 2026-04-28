@@ -51,17 +51,19 @@ def save_model_state(model: torch.nn.Module, path: str) -> None:
 
 
 def build_dataloaders(train_dataset, valid_dataset, test_dataset, batch_size: int) -> tuple:
-    cpu_count = os.cpu_count() or 4
-    num_workers = min(8, max(2, cpu_count // 2))
-    pin_memory = torch.cuda.is_available()
+    # Kaggle notebooks have a small RAM budget; many persistent workers with
+    # deep prefetch queues can keep several large batches resident at once.
+    default_workers = 0 if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") else 2
+    num_workers = max(0, int(os.environ.get("DATALOADER_WORKERS", str(default_workers))))
+    pin_memory = torch.cuda.is_available() and os.environ.get("PIN_MEMORY", "1") != "0"
     common_kwargs = {
         "batch_size": batch_size,
         "pin_memory": pin_memory,
         "num_workers": num_workers,
-        "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
-        common_kwargs["prefetch_factor"] = 4
+        common_kwargs["persistent_workers"] = os.environ.get("PERSISTENT_WORKERS", "0") == "1"
+        common_kwargs["prefetch_factor"] = max(1, int(os.environ.get("PREFETCH_FACTOR", "2")))
 
     train_loader = DataLoader(train_dataset, shuffle=True, drop_last=False, **common_kwargs)
     valid_loader = DataLoader(valid_dataset, shuffle=False, drop_last=False, **common_kwargs)
@@ -281,7 +283,7 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    batch_size = 32
+    batch_size = int(os.environ.get("BATCH_SIZE", "32"))
     num_epochs = 50
     learning_rate = 1e-4
     weight_decay = 1e-4
