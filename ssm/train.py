@@ -282,24 +282,24 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
 
     batch_size = int(os.environ.get("BATCH_SIZE", "32"))
-    num_epochs = 50
-    learning_rate = 1e-4
-    weight_decay = 1e-4
-    patience = 10
-    grad_clip = 1.0
+    num_epochs = int(os.environ.get("EPOCHS", "50"))
+    learning_rate = float(os.environ.get("LR", "1e-4"))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", "1e-4"))
+    patience = int(os.environ.get("PATIENCE", "10"))
+    grad_clip = float(os.environ.get("GRAD_CLIP", "1.0"))
 
-    sim_weight = 0.02
-    recon_weight = 0.05
-    moe_weight = 0.10
-    supcon_weight = 0.02
-    unsupcon_weight = 0.01
-    sim_margin = 0.20
+    sim_weight = float(os.environ.get("SIM_WEIGHT", "0.02"))
+    recon_weight = float(os.environ.get("RECON_WEIGHT", "0.05"))
+    moe_weight = float(os.environ.get("MOE_WEIGHT", "0.10"))
+    supcon_weight = float(os.environ.get("SUPCON_WEIGHT", "0.02"))
+    unsupcon_weight = float(os.environ.get("UNSUPCON_WEIGHT", "0.01"))
+    sim_margin = float(os.environ.get("SIM_MARGIN", "0.20"))
 
-    token_reg_weight = 0.04
-    shared_mixer_reg_weight = 0.030
-    shared_aux_weight = 0.10
-    acc5_loss_weight = 0.10
-    acc7_loss_weight = 0.06
+    token_reg_weight = float(os.environ.get("TOKEN_REG_WEIGHT", "0.04"))
+    shared_mixer_reg_weight = float(os.environ.get("MIXER_REG_WEIGHT", "0.030"))
+    shared_aux_weight = float(os.environ.get("SHARED_AUX_WEIGHT", "0.10"))
+    acc5_loss_weight = float(os.environ.get("ACC5_LOSS_WEIGHT", "0.10"))
+    acc7_loss_weight = float(os.environ.get("ACC7_LOSS_WEIGHT", "0.06"))
 
     dropout = 0.50
     conv_hidden = 128
