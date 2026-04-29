@@ -74,9 +74,7 @@ def build_dataloaders(train_dataset, valid_dataset, test_dataset, batch_size: in
 def maybe_wrap_dataparallel(model: torch.nn.Module, device: torch.device) -> tuple[torch.nn.Module, str]:
     if device.type == "cuda":
         gpu_count = torch.cuda.device_count()
-        if gpu_count >= 2:
-            model = torch.nn.DataParallel(model, device_ids=list(range(gpu_count)))
-            return model, f"DataParallel on {gpu_count} GPUs"
+        return model, f"single GPU cuda:0 (DataParallel disabled; visible GPUs: {gpu_count})"
     return model, "single device"
 
 
