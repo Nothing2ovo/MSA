@@ -11,12 +11,7 @@ from shared_mamba import SharedSelectiveStateMixer
 class ModalityInputProjector(nn.Module):
     def __init__(self, input_dim: int, output_dim: int = 128, dropout: float = 0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, output_dim, bias=False),
-            nn.LayerNorm(output_dim, elementwise_affine=False),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        self.net = nn.Linear(input_dim, output_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)

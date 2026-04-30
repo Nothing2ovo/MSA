@@ -546,10 +546,20 @@ def main() -> None:
     print("\n========== Final Validation ==========")
     for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_valid[k]:.4f}")
+    print(
+        f"pred mean/std : {final_valid['PredMean']:.4f} / {final_valid['PredStd']:.4f} | "
+        f"label mean/std: {final_valid['LabelMean']:.4f} / {final_valid['LabelStd']:.4f} | "
+        f"pred min/max  : {final_valid['PredMin']:.4f} / {final_valid['PredMax']:.4f}"
+    )
 
     print("\n========== Final Test ==========")
     for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_test[k]:.4f}")
+    print(
+        f"pred mean/std : {final_test['PredMean']:.4f} / {final_test['PredStd']:.4f} | "
+        f"label mean/std: {final_test['LabelMean']:.4f} / {final_test['LabelStd']:.4f} | "
+        f"pred min/max  : {final_test['PredMin']:.4f} / {final_test['PredMax']:.4f}"
+    )
 
     save_final_test_results(RESULTS_FILE, final_test)
     plot_training_curves(history, save_dir=PLOTS_DIR)
