@@ -36,22 +36,6 @@ def _as_float_tensor(x: torch.Tensor) -> torch.Tensor:
     return x.float() if isinstance(x, torch.Tensor) else torch.as_tensor(x, dtype=torch.float32)
 
 
-def _masked_sequence_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-    if mask is None:
-        return x.mean(dim=1)
-    mask = mask.to(device=x.device, dtype=torch.bool)
-    weight = mask.unsqueeze(-1).to(dtype=x.dtype)
-    return (x * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
-
-
-def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-    per_token = (pred - target).pow(2).mean(dim=-1)
-    if mask is None:
-        return per_token.mean()
-    mask = mask.to(device=pred.device, dtype=per_token.dtype)
-    return (per_token * mask).sum() / mask.sum().clamp_min(1.0)
-
-
 def _dp_reduce_scalar(x) -> float:
     if isinstance(x, torch.Tensor):
         return float(x.float().mean().item())
@@ -165,9 +149,9 @@ def _cross_modal_triplet(anchor: torch.Tensor, positive: torch.Tensor, labels: t
 
 
 def similarity_loss(aux: Dict[str, torch.Tensor], labels: torch.Tensor, margin: float = 0.2) -> torch.Tensor:
-    e_irr_t = _masked_sequence_mean(aux["e_irr_t"], aux.get("text_mask"))
-    e_irr_v = _masked_sequence_mean(aux["e_irr_v"], aux.get("vision_mask"))
-    e_irr_a = _masked_sequence_mean(aux["e_irr_a"], aux.get("audio_mask"))
+    e_irr_t = aux["e_irr_t"].mean(dim=1)
+    e_irr_v = aux["e_irr_v"].mean(dim=1)
+    e_irr_a = aux["e_irr_a"].mean(dim=1)
     losses = [
         _cross_modal_triplet(e_irr_t, e_irr_v, labels, margin),
         _cross_modal_triplet(e_irr_t, e_irr_a, labels, margin),
@@ -181,9 +165,9 @@ def similarity_loss(aux: Dict[str, torch.Tensor], labels: torch.Tensor, margin: 
 
 def reconstruction_loss(aux: Dict[str, torch.Tensor]) -> torch.Tensor:
     return (
-        _masked_mse(aux["rec_t"], aux["c_t"], aux.get("text_mask"))
-        + _masked_mse(aux["rec_v"], aux["c_v"], aux.get("vision_mask"))
-        + _masked_mse(aux["rec_a"], aux["c_a"], aux.get("audio_mask"))
+        F.mse_loss(aux["rec_t"], aux["c_t"])
+        + F.mse_loss(aux["rec_v"], aux["c_v"])
+        + F.mse_loss(aux["rec_a"], aux["c_a"])
     ) / 3.0
 
 
@@ -603,22 +587,9 @@ def evaluate(
         vision = batch["vision"].to(device, non_blocking=True).float()
         audio = batch["audio"].to(device, non_blocking=True).float()
         labels = batch["label"].to(device, non_blocking=True).float().view(-1)
-        text_mask = batch.get("text_mask")
-        vision_mask = batch.get("vision_mask")
-        audio_mask = batch.get("audio_mask")
-        text_mask = text_mask.to(device, non_blocking=True) if text_mask is not None else None
-        vision_mask = vision_mask.to(device, non_blocking=True) if vision_mask is not None else None
-        audio_mask = audio_mask.to(device, non_blocking=True) if audio_mask is not None else None
 
         with torch.amp.autocast(device_type=amp_device, enabled=use_amp):
-            preds, aux = model(
-                text,
-                vision,
-                audio,
-                text_mask=text_mask,
-                vision_mask=vision_mask,
-                audio_mask=audio_mask,
-            )
+            preds, aux = model(text, vision, audio)
             _, stats = total_loss(
                 preds,
                 labels,
@@ -759,23 +730,10 @@ def train_one_epoch(
         vision = batch["vision"].to(device, non_blocking=True).float()
         audio = batch["audio"].to(device, non_blocking=True).float()
         labels = batch["label"].to(device, non_blocking=True).float().view(-1)
-        text_mask = batch.get("text_mask")
-        vision_mask = batch.get("vision_mask")
-        audio_mask = batch.get("audio_mask")
-        text_mask = text_mask.to(device, non_blocking=True) if text_mask is not None else None
-        vision_mask = vision_mask.to(device, non_blocking=True) if vision_mask is not None else None
-        audio_mask = audio_mask.to(device, non_blocking=True) if audio_mask is not None else None
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=amp_device, enabled=use_amp):
-            preds, aux = model(
-                text,
-                vision,
-                audio,
-                text_mask=text_mask,
-                vision_mask=vision_mask,
-                audio_mask=audio_mask,
-            )
+            preds, aux = model(text, vision, audio)
             loss, stats = total_loss(
                 preds,
                 labels,

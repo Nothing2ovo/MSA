@@ -1,7 +1,6 @@
 import os
 import sys
 import random
-import importlib.util
 from datetime import datetime
 from typing import Dict
 
@@ -23,8 +22,8 @@ BASE_DIR = PROJECT_ROOT
 PLOTS_DIR = os.path.join(BASE_DIR, "plots", "ssmi")
 RESULTS_FILE = os.path.join(BASE_DIR, "results", "final_test_results_ssmi_mosi.txt")
 MODEL_DIR = os.path.join(BASE_DIR, "model file", "ssmi")
-BEST_MODEL_FILE = os.path.join(MODEL_DIR, "best_ssmi_mosi_regression.pt")
-BEST_MAE_MODEL_FILE = os.path.join(MODEL_DIR, "best_ssmi_mosi_mae.pt")
+BEST_MODEL_FILE = os.path.join(MODEL_DIR, "best_ssmi_mosi_direct_pred.pt")
+BEST_MAE_MODEL_FILE = os.path.join(MODEL_DIR, "best_ssmi_mosi_mae_ref.pt")
 DEFAULT_DATA_FILE = os.path.join(BASE_DIR, "data", "aligned_50.pkl")
 
 
@@ -67,20 +66,6 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 def save_model_state(model: torch.nn.Module, path: str) -> None:
     torch.save(unwrap_model(model).state_dict(), path)
-
-
-def resolve_mamba_mode() -> tuple[bool, str]:
-    requested = os.environ.get("REQUIRE_OFFICIAL_MAMBA", "auto").strip().lower()
-    mamba_available = importlib.util.find_spec("mamba_ssm") is not None
-    if requested in {"1", "true", "yes", "official"}:
-        if mamba_available:
-            return True, "official mamba_ssm"
-        return False, "fallback mixer (mamba_ssm is unavailable in this environment)"
-    if requested in {"0", "false", "no", "fallback"}:
-        return False, "fallback mixer (requested by REQUIRE_OFFICIAL_MAMBA)"
-    if mamba_available:
-        return True, "official mamba_ssm (auto-detected)"
-    return False, "fallback mixer (auto: mamba_ssm not installed)"
 
 
 def build_dataloaders(train_dataset, valid_dataset, test_dataset, batch_size: int) -> tuple:
@@ -211,7 +196,7 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
     analysis = metrics["analysis"]
     lines = [
         f"[{timestamp}]",
-        "========== Final Test (MOSI SSMI: 128-d modality projection + shared-residual SSM + TMoEs + 4-token direct prediction) ==========",
+        "========== Final Test (MOSI, MOSEI-equivalent official-Mamba SSM + 128-d input projection) ==========",
         f"Test total loss: {metrics['total_loss']:.4f}",
         f"Test task loss : {metrics['task_loss']:.4f}",
         f"Test sim loss  : {metrics['sim_loss']:.4f}",
@@ -321,43 +306,40 @@ def main() -> None:
     patience = int(os.environ.get("PATIENCE", "10"))
     grad_clip = float(os.environ.get("GRAD_CLIP", "1.0"))
 
-    sim_weight = float(os.environ.get("SIM_WEIGHT", "0.01"))
-    recon_weight = float(os.environ.get("RECON_WEIGHT", "0.02"))
-    moe_weight = float(os.environ.get("MOE_WEIGHT", "0.05"))
-    supcon_weight = float(os.environ.get("SUPCON_WEIGHT", "0.00"))
-    unsupcon_weight = float(os.environ.get("UNSUPCON_WEIGHT", "0.00"))
+    sim_weight = float(os.environ.get("SIM_WEIGHT", "0.02"))
+    recon_weight = float(os.environ.get("RECON_WEIGHT", "0.05"))
+    moe_weight = float(os.environ.get("MOE_WEIGHT", "0.10"))
+    supcon_weight = float(os.environ.get("SUPCON_WEIGHT", "0.02"))
+    unsupcon_weight = float(os.environ.get("UNSUPCON_WEIGHT", "0.01"))
     sim_margin = float(os.environ.get("SIM_MARGIN", "0.20"))
 
-    token_reg_weight = float(os.environ.get("TOKEN_REG_WEIGHT", "0.01"))
-    shared_mixer_reg_weight = float(os.environ.get("MIXER_REG_WEIGHT", "0.010"))
-    shared_aux_weight = float(os.environ.get("SHARED_AUX_WEIGHT", "0.00"))
-    acc5_loss_weight = float(os.environ.get("ACC5_LOSS_WEIGHT", "0.03"))
-    acc7_loss_weight = float(os.environ.get("ACC7_LOSS_WEIGHT", "0.02"))
+    token_reg_weight = float(os.environ.get("TOKEN_REG_WEIGHT", "0.04"))
+    shared_mixer_reg_weight = float(os.environ.get("MIXER_REG_WEIGHT", "0.030"))
+    shared_aux_weight = float(os.environ.get("SHARED_AUX_WEIGHT", "0.10"))
+    acc5_loss_weight = float(os.environ.get("ACC5_LOSS_WEIGHT", "0.10"))
+    acc7_loss_weight = float(os.environ.get("ACC7_LOSS_WEIGHT", "0.06"))
 
-    dropout = float(os.environ.get("DROPOUT", "0.10"))
+    dropout = float(os.environ.get("DROPOUT", "0.50"))
     input_hidden = int(os.environ.get("INPUT_HIDDEN", "128"))
     conv_hidden = int(os.environ.get("CONV_HIDDEN", "128"))
-    shared_dim = int(os.environ.get("SHARED_DIM", "96"))
-    private_dim = int(os.environ.get("PRIVATE_DIM", "96"))
-    shared_mixer_hidden = int(os.environ.get("SHARED_MIXER_HIDDEN", "96"))
+    shared_dim = int(os.environ.get("SHARED_DIM", "64"))
+    private_dim = int(os.environ.get("PRIVATE_DIM", "64"))
+    shared_mixer_hidden = int(os.environ.get("SHARED_MIXER_HIDDEN", "64"))
     fusion_dim = int(os.environ.get("FUSION_DIM", "128"))
     num_experts = int(os.environ.get("NUM_EXPERTS", "3"))
-    top_k = int(os.environ.get("TOP_K", "2"))
+    top_k = int(os.environ.get("TOP_K", "1"))
     num_heads = int(os.environ.get("NUM_HEADS", "4"))
     mixer_layers = int(os.environ.get("MIXER_LAYERS", "1"))
     mamba_state_dim = int(os.environ.get("MAMBA_STATE_DIM", "16"))
-    shared_drop_rate = float(os.environ.get("SHARED_DROP_RATE", "0.10"))
-    bounded_output = os.environ.get("BOUNDED_OUTPUT", "1") != "0"
-    require_official_mamba, mamba_mode = resolve_mamba_mode()
+    shared_drop_rate = float(os.environ.get("SHARED_DROP_RATE", "0.15"))
 
-    print("[Config] MOSI SSMI / 128-d modality projection / Shared Selective State Mixer / TMoEs / 4-token direct prediction")
+    print("[Config] MOSI with MOSEI-equivalent official-Mamba SSM / 128-d input projection / TMoEs / 4-token direct prediction")
     print(
         f"[Config] input_hidden={input_hidden} sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
         f"token_reg={token_reg_weight:.3f} mixer_reg={shared_mixer_reg_weight:.3f} shared_aux={shared_aux_weight:.3f} "
         f"dropout={dropout:.2f} dims={conv_hidden}/{shared_dim}/{private_dim}/{shared_mixer_hidden} "
-        f"shared_drop={shared_drop_rate:.2f} bounded={bounded_output} mamba_state={mamba_state_dim} "
-        f"mixer={mamba_mode} | ckpt=MAE>Corr"
+        f"shared_drop={shared_drop_rate:.2f} mamba_state={mamba_state_dim} | ckpt=MAE>Corr"
     )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -373,10 +355,7 @@ def main() -> None:
     print("dataset: MOSI")
     print("data:", data_file)
     print(f"train/valid/test: {meta['train_size']}/{meta['valid_size']}/{meta['test_size']}")
-    print(
-        f"dims: text={meta['text_dim']}, vision={meta['vision_dim']}, audio={meta['audio_dim']} "
-        f"-> projected={input_hidden}"
-    )
+    print(f"dims: text={meta['text_dim']}, vision={meta['vision_dim']}, audio={meta['audio_dim']} -> projected={input_hidden}")
 
     train_loader, valid_loader, test_loader, num_workers = build_dataloaders(
         train_dataset, valid_dataset, test_dataset, batch_size=batch_size
@@ -404,8 +383,7 @@ def main() -> None:
         shared_drop_rate=shared_drop_rate,
         shared_residual_scale=0.20,
         use_shared_cross_attention=False,
-        require_official_mamba=require_official_mamba,
-        bounded_output=bounded_output,
+        require_official_mamba=True,
     ).to(device)
     model, parallel_mode = maybe_wrap_dataparallel(model, device)
     print("parallel_mode:", parallel_mode)

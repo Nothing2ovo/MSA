@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,36 +22,10 @@ class AttentionPool(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        score = self.score(x).squeeze(-1)
-        if mask is not None:
-            mask = mask.to(device=x.device, dtype=torch.bool)
-            score = score.masked_fill(~mask, -1e4)
-        attn = torch.softmax(score, dim=1)
-        if mask is not None:
-            attn = attn * mask.to(dtype=attn.dtype)
-            attn = attn / attn.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        attn = torch.softmax(self.score(x).squeeze(-1), dim=1)
         pooled = torch.sum(attn.unsqueeze(-1) * x, dim=1)
         return pooled, attn
-
-
-class LightweightStateMixer(nn.Module):
-    """Small CUDA-free fallback used for smoke tests or CPU-only notebooks."""
-
-    def __init__(self, dim: int, conv_kernel: int = 3, expand: int = 2):
-        super().__init__()
-        padding = conv_kernel // 2
-        hidden = dim * expand
-        self.depthwise = nn.Conv1d(dim, dim, kernel_size=conv_kernel, padding=padding, groups=dim)
-        self.pointwise = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.depthwise(x.transpose(1, 2)).transpose(1, 2)
-        return self.pointwise(y)
 
 
 class GlobalLocalContextExtractor(nn.Module):
@@ -92,24 +66,22 @@ class OfficialMambaBlock(nn.Module):
         require_official_mamba: bool = True,
     ):
         super().__init__()
-        if _OfficialMamba is None:
-            if require_official_mamba:
-                raise RuntimeError(
-                    "mamba_ssm is not installed. Install official Mamba first, for example:\n"
-                    "pip install causal-conv1d>=1.4.0 mamba-ssm>=2.2.2\n"
-                    "Then rerun training on a CUDA-enabled PyTorch environment."
-                )
-            mamba = LightweightStateMixer(dim=dim, conv_kernel=conv_kernel, expand=expand)
-        else:
-            mamba = _OfficialMamba(
-                d_model=dim,
-                d_state=state_dim,
-                d_conv=conv_kernel,
-                expand=expand,
+        if _OfficialMamba is None and require_official_mamba:
+            raise RuntimeError(
+                "mamba_ssm is not installed. Install official Mamba first, for example:\n"
+                "pip install causal-conv1d>=1.4.0 mamba-ssm>=2.2.2\n"
+                "Then rerun training on a CUDA-enabled PyTorch environment."
             )
+        if _OfficialMamba is None:
+            raise RuntimeError("Official Mamba is required in this version; fallback implementation is intentionally disabled.")
 
         self.norm = nn.LayerNorm(dim)
-        self.mamba = mamba
+        self.mamba = _OfficialMamba(
+            d_model=dim,
+            d_state=state_dim,
+            d_conv=conv_kernel,
+            expand=expand,
+        )
         self.select_probe = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
         self.out_norm = nn.LayerNorm(dim)
@@ -382,44 +354,21 @@ class SharedSelectiveStateMixer(nn.Module):
         mask = mask.view(num_modalities, seq_len).unsqueeze(0).unsqueeze(-1)
         return x * mask
 
-    @staticmethod
-    def _masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor], dim: int) -> torch.Tensor:
-        if mask is None:
-            return x.mean(dim=dim)
-        weight = mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
-        return (x * weight).sum(dim=dim) / weight.sum(dim=dim).clamp_min(1.0)
-
     def forward(
         self,
         shared_seq: torch.Tensor,
         drop_rate: float = 0.0,
         deterministic_drop: bool = False,
-        temporal_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size, num_modalities, seq_len, _ = shared_seq.shape
         if num_modalities != 3:
             raise ValueError("SharedSelectiveStateMixer expects [B, 3, T, D] shared features.")
         if seq_len > self.max_seq_len:
             raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}.")
-        if temporal_mask is not None:
-            temporal_mask = temporal_mask.to(device=shared_seq.device, dtype=torch.bool)
-            if temporal_mask.shape != (batch_size, num_modalities, seq_len):
-                raise ValueError(
-                    f"temporal_mask must be [B, 3, T], got {tuple(temporal_mask.shape)} for B={batch_size}, T={seq_len}."
-                )
-            empty = temporal_mask.sum(dim=2) == 0
-            if empty.any():
-                temporal_mask = temporal_mask.clone()
-                temporal_mask[empty] = True
-            temporal_weight = temporal_mask.unsqueeze(-1).to(dtype=shared_seq.dtype)
-        else:
-            temporal_weight = None
 
         x = self.input_proj(shared_seq)
         x = x + self.modality_embed + self.time_embed[:, :, :seq_len]
         x = self._apply_token_drop(x, drop_rate=drop_rate, deterministic=deterministic_drop)
-        if temporal_weight is not None:
-            x = x * temporal_weight
 
         cross_means: List[torch.Tensor] = []
         intra_means: List[torch.Tensor] = []
@@ -430,13 +379,10 @@ class SharedSelectiveStateMixer(nn.Module):
         spreads: List[torch.Tensor] = []
         layer_gates: List[torch.Tensor] = []
 
-        text_mask = None if temporal_mask is None else temporal_mask[:, 0]
-        text_context, _ = self.text_pool(x[:, 0], mask=text_mask)
+        text_context, _ = self.text_pool(x[:, 0])
         for layer in self.layers:
             x, layer_stats = layer(x, text_context=text_context)
-            if temporal_weight is not None:
-                x = x * temporal_weight
-            text_context, _ = self.text_pool(x[:, 0], mask=text_mask)
+            text_context, _ = self.text_pool(x[:, 0])
 
             cross_mean = layer_stats["cross_select_mean"]
             intra_mean = layer_stats["intra_select_mean"]
@@ -455,20 +401,13 @@ class SharedSelectiveStateMixer(nn.Module):
             spreads.append(spread)
             layer_gates.append(layer_stats["intra_cross_gate_mean"])
 
-        modality_repr = self._masked_mean(x, temporal_mask, dim=2)
+        modality_repr = x.mean(dim=2)
         modality_score = self.modality_readout(modality_repr).squeeze(-1)
         modality_attn = torch.softmax(modality_score, dim=-1)
         intra_summary = torch.sum(modality_attn.unsqueeze(-1) * modality_repr, dim=1)
 
         cross_tokens = x.permute(0, 2, 1, 3).reshape(batch_size, seq_len * 3, self.hidden_dim)
-        cross_token_score = self.token_readout(cross_tokens).squeeze(-1)
-        if temporal_mask is not None:
-            cross_token_mask = temporal_mask.permute(0, 2, 1).reshape(batch_size, seq_len * 3)
-            cross_token_score = cross_token_score.masked_fill(~cross_token_mask, -1e4)
-        cross_token_attn = torch.softmax(cross_token_score, dim=1)
-        if temporal_mask is not None:
-            cross_token_attn = cross_token_attn * cross_token_mask.to(dtype=cross_token_attn.dtype)
-            cross_token_attn = cross_token_attn / cross_token_attn.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        cross_token_attn = torch.softmax(self.token_readout(cross_tokens).squeeze(-1), dim=1)
         cross_summary = torch.sum(cross_token_attn.unsqueeze(-1) * cross_tokens, dim=1)
 
         intra_summary = self.intra_proj(intra_summary)
