@@ -372,7 +372,18 @@ def shared_auxiliary_loss(aux: Dict[str, torch.Tensor], labels: torch.Tensor) ->
 
 
 def task_loss_regression(preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    return F.mse_loss(preds.view(-1), labels.view(-1))
+    preds = preds.view(-1)
+    labels = labels.view(-1)
+    smooth_l1 = F.smooth_l1_loss(preds, labels, beta=0.5)
+    mae = torch.mean(torch.abs(preds - labels))
+    pred_centered = preds - preds.mean()
+    label_centered = labels - labels.mean()
+    corr = torch.sum(pred_centered * label_centered) / (
+        torch.sqrt(torch.sum(pred_centered ** 2) + 1e-8)
+        * torch.sqrt(torch.sum(label_centered ** 2) + 1e-8)
+    )
+    corr_loss = 1.0 - corr
+    return 0.50 * smooth_l1 + 0.35 * mae + 0.15 * corr_loss
 
 
 def ordinal_threshold_loss(preds: torch.Tensor, labels: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
@@ -458,7 +469,7 @@ def total_loss(
         shared_repr = shared_repr.reshape(-1, shared_repr.shape[-1])
     if shared_repr_aug.dim() > 2:
         shared_repr_aug = shared_repr_aug.reshape(-1, shared_repr_aug.shape[-1])
-    fused_repr = _as_float_tensor(aux["fused_repr"])
+    fused_repr = _as_float_tensor(aux.get("final_repr", aux["fused_repr"]))
     if fused_repr.dim() > 2:
         fused_repr = fused_repr.reshape(-1, fused_repr.shape[-1])
 

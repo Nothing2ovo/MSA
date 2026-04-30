@@ -333,6 +333,64 @@ class TokenTransformerBlock(nn.Module):
         return x, attn_weights
 
 
+class CrossModalTemporalFusion(nn.Module):
+    def __init__(
+        self,
+        shared_dim: int,
+        private_dim: int,
+        fusion_dim: int,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        max_seq_len: int = 64,
+    ):
+        super().__init__()
+        self.max_seq_len = int(max_seq_len)
+        self.shared_proj = nn.Sequential(
+            nn.Linear(shared_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+        )
+        self.private_proj = nn.Sequential(
+            nn.Linear(private_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+        )
+        self.type_embed = nn.Parameter(torch.zeros(1, 6, 1, fusion_dim))
+        self.time_embed = nn.Parameter(torch.zeros(1, 1, max_seq_len, fusion_dim))
+        nn.init.trunc_normal_(self.type_embed, std=0.02)
+        nn.init.trunc_normal_(self.time_embed, std=0.02)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=fusion_dim,
+            nhead=num_heads,
+            dim_feedforward=fusion_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=1)
+        self.pool = AttentionPool(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
+        self.norm = nn.LayerNorm(fusion_dim)
+
+    def forward(
+        self,
+        shared_sequence: torch.Tensor,
+        private_sequence: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, _, seq_len, _ = shared_sequence.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}.")
+
+        shared_tokens = self.shared_proj(shared_sequence)
+        private_tokens = self.private_proj(private_sequence)
+        tokens = torch.cat([shared_tokens, private_tokens], dim=1)
+        tokens = tokens + self.type_embed + self.time_embed[:, :, :seq_len]
+        flat = tokens.permute(0, 2, 1, 3).reshape(batch_size, seq_len * 6, -1)
+        encoded = self.encoder(flat)
+        pooled, attn = self.pool(encoded)
+        return self.norm(pooled), encoded, attn
+
+
 class RegressionHead(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int = 128, dropout: float = 0.1):
         super().__init__()
@@ -440,6 +498,29 @@ class DHMModel(nn.Module):
         )
         self.token_fusion_block = TokenTransformerBlock(token_dim=fusion_dim, num_heads=num_heads, dropout=dropout)
         self.fusion_norm = nn.LayerNorm(fusion_dim)
+        self.temporal_fusion = CrossModalTemporalFusion(
+            shared_dim=shared_mixer_hidden,
+            private_dim=private_dim,
+            fusion_dim=fusion_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            max_seq_len=64,
+        )
+        self.direct_pool_t = AttentionPool(conv_hidden, hidden_dim=conv_hidden, dropout=dropout)
+        self.direct_pool_v = AttentionPool(conv_hidden, hidden_dim=conv_hidden, dropout=dropout)
+        self.direct_pool_a = AttentionPool(conv_hidden, hidden_dim=conv_hidden, dropout=dropout)
+        self.direct_proj = nn.Sequential(
+            nn.Linear(conv_hidden * 3, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.prediction_gate = nn.Sequential(
+            nn.Linear(fusion_dim * 3, fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, 3),
+        )
         self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
 
     def _build_shared(self, c: torch.Tensor, core_encoder: nn.Module, residual_encoder: nn.Module) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -471,14 +552,11 @@ class DHMModel(nn.Module):
             drop_rate=0.0,
             deterministic_drop=False,
         )
-        # Avoid running the official-Mamba shared mixer twice per forward pass.
-        # A lightweight dropout view is sufficient for the unsupervised
-        # contrastive branch and keeps Kaggle memory use much lower.
-        if self.training and self.shared_drop_rate > 0.0:
-            shared_repr_aug = F.dropout(shared_repr, p=self.shared_drop_rate, training=True)
-        else:
-            shared_repr_aug = shared_repr
-        shared_mixer_aux_aug = shared_mixer_aux
+        shared_repr_aug, shared_mixer_aux_aug = self.shared_mixer(
+            shared_sequences,
+            drop_rate=self.shared_drop_rate,
+            deterministic_drop=not self.training,
+        )
         shared_proj = F.normalize(self.shared_proj_head(shared_repr), dim=-1)
         shared_proj_aug = F.normalize(self.shared_proj_head(shared_repr_aug), dim=-1)
         shared_pred = self.shared_aux_head(shared_repr)
@@ -492,7 +570,25 @@ class DHMModel(nn.Module):
         token_weights = token_fusion_aux["token_weights"]
         fused_repr = torch.sum(fused_tokens * token_weights.unsqueeze(-1), dim=1)
         fused_repr = self.fusion_norm(fused_repr)
-        pred = self.regressor(fused_repr)
+
+        shared_refined_sequence = shared_mixer_aux["refined_sequence"]
+        private_sequences = torch.stack([e_spe_t, e_spe_v, e_spe_a], dim=1)
+        temporal_repr, temporal_tokens, temporal_attn = self.temporal_fusion(
+            shared_refined_sequence,
+            private_sequences,
+        )
+        direct_t, direct_t_attn = self.direct_pool_t(c_t)
+        direct_v, direct_v_attn = self.direct_pool_v(c_v)
+        direct_a, direct_a_attn = self.direct_pool_a(c_a)
+        direct_repr = self.direct_proj(torch.cat([direct_t, direct_v, direct_a], dim=-1))
+
+        prediction_parts = torch.stack([fused_repr, temporal_repr, direct_repr], dim=1)
+        prediction_gate = torch.softmax(
+            self.prediction_gate(torch.cat([fused_repr, temporal_repr, direct_repr], dim=-1)),
+            dim=-1,
+        )
+        final_repr = torch.sum(prediction_parts * prediction_gate.unsqueeze(-1), dim=1)
+        pred = self.regressor(final_repr)
 
         aux = {
             "c_t": c_t,
@@ -526,6 +622,15 @@ class DHMModel(nn.Module):
             "weighted_tokens": weighted_tokens,
             "fused_tokens": fused_tokens,
             "fused_repr": fused_repr,
+            "temporal_tokens": temporal_tokens,
+            "temporal_repr": temporal_repr,
+            "temporal_attn": temporal_attn,
+            "direct_repr": direct_repr,
+            "direct_attn_t": direct_t_attn,
+            "direct_attn_v": direct_v_attn,
+            "direct_attn_a": direct_a_attn,
+            "prediction_gate": prediction_gate,
+            "final_repr": final_repr,
             "shared_mixer_aux": shared_mixer_aux,
             "shared_mixer_aux_aug": shared_mixer_aux_aug,
             "tmoe_t_aux": tmoe_t_aux,

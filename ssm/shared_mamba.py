@@ -426,6 +426,7 @@ class SharedSelectiveStateMixer(nn.Module):
         per_layer_gates = torch.stack(layer_gates)
 
         aux = {
+            "refined_sequence": x,
             "cross_select_mean": per_layer_cross_means.mean(),
             "intra_select_mean": per_layer_intra_means.mean(),
             "cross_select_std": per_layer_cross_stds.mean(),
