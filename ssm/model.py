@@ -440,6 +440,24 @@ class DHMModel(nn.Module):
         )
         self.token_fusion_block = TokenTransformerBlock(token_dim=fusion_dim, num_heads=num_heads, dropout=dropout)
         self.fusion_norm = nn.LayerNorm(fusion_dim)
+        self.direct_pool_t = AttentionPool(conv_hidden, hidden_dim=conv_hidden, dropout=dropout)
+        self.direct_pool_v = AttentionPool(conv_hidden, hidden_dim=conv_hidden, dropout=dropout)
+        self.direct_pool_a = AttentionPool(conv_hidden, hidden_dim=conv_hidden, dropout=dropout)
+        self.direct_proj = nn.Sequential(
+            nn.Linear(conv_hidden * 3, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.direct_residual_gate = nn.Sequential(
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, 1),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.direct_residual_gate[-2].weight)
+        nn.init.constant_(self.direct_residual_gate[-2].bias, -2.0)
         self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
 
     def _build_shared(self, c: torch.Tensor, core_encoder: nn.Module, residual_encoder: nn.Module) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -489,7 +507,14 @@ class DHMModel(nn.Module):
         token_weights = token_fusion_aux["token_weights"]
         fused_repr = torch.sum(fused_tokens * token_weights.unsqueeze(-1), dim=1)
         fused_repr = self.fusion_norm(fused_repr)
-        pred = self.regressor(fused_repr)
+
+        direct_t, direct_t_attn = self.direct_pool_t(c_t)
+        direct_v, direct_v_attn = self.direct_pool_v(c_v)
+        direct_a, direct_a_attn = self.direct_pool_a(c_a)
+        direct_repr = self.direct_proj(torch.cat([direct_t, direct_v, direct_a], dim=-1))
+        direct_gate = self.direct_residual_gate(torch.cat([fused_repr, direct_repr], dim=-1))
+        final_repr = fused_repr + direct_gate * direct_repr
+        pred = self.regressor(final_repr)
 
         aux = {
             "c_t": c_t,
@@ -523,6 +548,12 @@ class DHMModel(nn.Module):
             "weighted_tokens": weighted_tokens,
             "fused_tokens": fused_tokens,
             "fused_repr": fused_repr,
+            "direct_repr": direct_repr,
+            "direct_gate": direct_gate,
+            "direct_attn_t": direct_t_attn,
+            "direct_attn_v": direct_v_attn,
+            "direct_attn_a": direct_a_attn,
+            "final_repr": final_repr,
             "shared_mixer_aux": shared_mixer_aux,
             "shared_mixer_aux_aug": shared_mixer_aux_aug,
             "tmoe_t_aux": tmoe_t_aux,

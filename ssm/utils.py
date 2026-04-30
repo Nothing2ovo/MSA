@@ -458,7 +458,7 @@ def total_loss(
         shared_repr = shared_repr.reshape(-1, shared_repr.shape[-1])
     if shared_repr_aug.dim() > 2:
         shared_repr_aug = shared_repr_aug.reshape(-1, shared_repr_aug.shape[-1])
-    fused_repr = _as_float_tensor(aux["fused_repr"])
+    fused_repr = _as_float_tensor(aux.get("final_repr", aux["fused_repr"]))
     if fused_repr.dim() > 2:
         fused_repr = fused_repr.reshape(-1, fused_repr.shape[-1])
 
@@ -504,6 +504,7 @@ def total_loss(
         "gate_a_mean": _dp_reduce_scalar(gate_a_probs.max(dim=-1).values.mean()),
         "shared_view_gap": _dp_reduce_scalar(torch.mean(torch.abs(shared_repr - shared_repr_aug))),
         "fused_repr_norm": _dp_reduce_scalar(fused_repr.norm(dim=-1).mean()),
+        "direct_gate_mean": _dp_reduce_scalar(aux.get("direct_gate", torch.zeros((), device=preds.device)).mean()),
     }
     return total, stats
 
