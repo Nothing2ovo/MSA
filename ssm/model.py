@@ -471,14 +471,11 @@ class DHMModel(nn.Module):
             drop_rate=0.0,
             deterministic_drop=False,
         )
-        # Avoid running the official-Mamba shared mixer twice per forward pass.
-        # A lightweight dropout view is sufficient for the unsupervised
-        # contrastive branch and keeps Kaggle memory use much lower.
-        if self.training and self.shared_drop_rate > 0.0:
-            shared_repr_aug = F.dropout(shared_repr, p=self.shared_drop_rate, training=True)
-        else:
-            shared_repr_aug = shared_repr
-        shared_mixer_aux_aug = shared_mixer_aux
+        shared_repr_aug, shared_mixer_aux_aug = self.shared_mixer(
+            shared_sequences,
+            drop_rate=self.shared_drop_rate,
+            deterministic_drop=not self.training,
+        )
         shared_proj = F.normalize(self.shared_proj_head(shared_repr), dim=-1)
         shared_proj_aug = F.normalize(self.shared_proj_head(shared_repr_aug), dim=-1)
         shared_pred = self.shared_aux_head(shared_repr)

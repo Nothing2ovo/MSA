@@ -305,12 +305,12 @@ def main() -> None:
     conv_hidden = 128
     shared_dim = 64
     private_dim = 64
-    shared_mixer_hidden = 64
+    shared_mixer_hidden = 96
     fusion_dim = 128
     num_experts = 3
     top_k = 1
     num_heads = 4
-    mixer_layers = 1
+    mixer_layers = 2
     mamba_state_dim = 16
     shared_drop_rate = 0.15
 
@@ -359,7 +359,7 @@ def main() -> None:
         dropout=dropout,
         shared_drop_rate=shared_drop_rate,
         shared_residual_scale=0.20,
-        use_shared_cross_attention=False,
+        use_shared_cross_attention=True,
         require_official_mamba=True,
     ).to(device)
     model, parallel_mode = maybe_wrap_dataparallel(model, device)
