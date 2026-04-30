@@ -371,8 +371,9 @@ class TokenTransformerBlock(nn.Module):
 
 
 class RegressionHead(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 128, dropout: float = 0.1):
+    def __init__(self, input_dim: int, hidden_dim: int = 128, dropout: float = 0.1, bounded: bool = False):
         super().__init__()
+        self.bounded = bool(bounded)
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -385,7 +386,10 @@ class RegressionHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+        out = self.net(x).squeeze(-1)
+        if self.bounded:
+            out = 3.0 * torch.tanh(out / 3.0)
+        return out
 
 
 class DHMModel(nn.Module):
@@ -420,6 +424,7 @@ class DHMModel(nn.Module):
         shared_residual_scale: float = 0.20,
         use_shared_cross_attention: bool = True,
         require_official_mamba: bool = True,
+        bounded_output: bool = True,
     ):
         super().__init__()
         self.shared_drop_rate = float(shared_drop_rate)
@@ -468,7 +473,12 @@ class DHMModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(shared_mixer_hidden, shared_mixer_hidden),
         )
-        self.shared_aux_head = RegressionHead(shared_mixer_hidden, hidden_dim=shared_mixer_hidden, dropout=dropout)
+        self.shared_aux_head = RegressionHead(
+            shared_mixer_hidden,
+            hidden_dim=shared_mixer_hidden,
+            dropout=dropout,
+            bounded=bounded_output,
+        )
 
         self.tmoe_t = SparseTMoE(private_dim, num_experts=num_experts, top_k=top_k, num_heads=num_heads, dropout=dropout)
         self.tmoe_v = SparseTMoE(private_dim, num_experts=num_experts, top_k=top_k, num_heads=num_heads, dropout=dropout)
@@ -482,7 +492,7 @@ class DHMModel(nn.Module):
         )
         self.token_fusion_block = TokenTransformerBlock(token_dim=fusion_dim, num_heads=num_heads, dropout=dropout)
         self.fusion_norm = nn.LayerNorm(fusion_dim)
-        self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
+        self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout, bounded=bounded_output)
 
     @staticmethod
     def _apply_mask(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

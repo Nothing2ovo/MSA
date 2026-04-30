@@ -321,32 +321,33 @@ def main() -> None:
     patience = int(os.environ.get("PATIENCE", "10"))
     grad_clip = float(os.environ.get("GRAD_CLIP", "1.0"))
 
-    sim_weight = float(os.environ.get("SIM_WEIGHT", "0.02"))
-    recon_weight = float(os.environ.get("RECON_WEIGHT", "0.05"))
-    moe_weight = float(os.environ.get("MOE_WEIGHT", "0.10"))
-    supcon_weight = float(os.environ.get("SUPCON_WEIGHT", "0.02"))
-    unsupcon_weight = float(os.environ.get("UNSUPCON_WEIGHT", "0.01"))
+    sim_weight = float(os.environ.get("SIM_WEIGHT", "0.01"))
+    recon_weight = float(os.environ.get("RECON_WEIGHT", "0.02"))
+    moe_weight = float(os.environ.get("MOE_WEIGHT", "0.05"))
+    supcon_weight = float(os.environ.get("SUPCON_WEIGHT", "0.00"))
+    unsupcon_weight = float(os.environ.get("UNSUPCON_WEIGHT", "0.00"))
     sim_margin = float(os.environ.get("SIM_MARGIN", "0.20"))
 
-    token_reg_weight = float(os.environ.get("TOKEN_REG_WEIGHT", "0.04"))
-    shared_mixer_reg_weight = float(os.environ.get("MIXER_REG_WEIGHT", "0.030"))
-    shared_aux_weight = float(os.environ.get("SHARED_AUX_WEIGHT", "0.10"))
-    acc5_loss_weight = float(os.environ.get("ACC5_LOSS_WEIGHT", "0.10"))
-    acc7_loss_weight = float(os.environ.get("ACC7_LOSS_WEIGHT", "0.06"))
+    token_reg_weight = float(os.environ.get("TOKEN_REG_WEIGHT", "0.01"))
+    shared_mixer_reg_weight = float(os.environ.get("MIXER_REG_WEIGHT", "0.010"))
+    shared_aux_weight = float(os.environ.get("SHARED_AUX_WEIGHT", "0.00"))
+    acc5_loss_weight = float(os.environ.get("ACC5_LOSS_WEIGHT", "0.03"))
+    acc7_loss_weight = float(os.environ.get("ACC7_LOSS_WEIGHT", "0.02"))
 
-    dropout = float(os.environ.get("DROPOUT", "0.50"))
+    dropout = float(os.environ.get("DROPOUT", "0.10"))
     input_hidden = int(os.environ.get("INPUT_HIDDEN", "128"))
-    conv_hidden = 128
-    shared_dim = 64
-    private_dim = 64
-    shared_mixer_hidden = 64
-    fusion_dim = 128
-    num_experts = 3
-    top_k = 1
-    num_heads = 4
-    mixer_layers = 1
-    mamba_state_dim = 16
-    shared_drop_rate = 0.15
+    conv_hidden = int(os.environ.get("CONV_HIDDEN", "128"))
+    shared_dim = int(os.environ.get("SHARED_DIM", "96"))
+    private_dim = int(os.environ.get("PRIVATE_DIM", "96"))
+    shared_mixer_hidden = int(os.environ.get("SHARED_MIXER_HIDDEN", "96"))
+    fusion_dim = int(os.environ.get("FUSION_DIM", "128"))
+    num_experts = int(os.environ.get("NUM_EXPERTS", "3"))
+    top_k = int(os.environ.get("TOP_K", "2"))
+    num_heads = int(os.environ.get("NUM_HEADS", "4"))
+    mixer_layers = int(os.environ.get("MIXER_LAYERS", "1"))
+    mamba_state_dim = int(os.environ.get("MAMBA_STATE_DIM", "16"))
+    shared_drop_rate = float(os.environ.get("SHARED_DROP_RATE", "0.10"))
+    bounded_output = os.environ.get("BOUNDED_OUTPUT", "1") != "0"
     require_official_mamba, mamba_mode = resolve_mamba_mode()
 
     print("[Config] MOSI SSMI / 128-d modality projection / Shared Selective State Mixer / TMoEs / 4-token direct prediction")
@@ -354,7 +355,9 @@ def main() -> None:
         f"[Config] input_hidden={input_hidden} sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
         f"token_reg={token_reg_weight:.3f} mixer_reg={shared_mixer_reg_weight:.3f} shared_aux={shared_aux_weight:.3f} "
-        f"shared_drop={shared_drop_rate:.2f} mamba_state={mamba_state_dim} mixer={mamba_mode} | ckpt=MAE>Corr"
+        f"dropout={dropout:.2f} dims={conv_hidden}/{shared_dim}/{private_dim}/{shared_mixer_hidden} "
+        f"shared_drop={shared_drop_rate:.2f} bounded={bounded_output} mamba_state={mamba_state_dim} "
+        f"mixer={mamba_mode} | ckpt=MAE>Corr"
     )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -402,6 +405,7 @@ def main() -> None:
         shared_residual_scale=0.20,
         use_shared_cross_attention=False,
         require_official_mamba=require_official_mamba,
+        bounded_output=bounded_output,
     ).to(device)
     model, parallel_mode = maybe_wrap_dataparallel(model, device)
     print("parallel_mode:", parallel_mode)
