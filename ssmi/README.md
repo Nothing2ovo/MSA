@@ -27,7 +27,7 @@ MOSI_PKL=/path/to/aligned_50.pkl
 EPOCHS=50
 BATCH_SIZE=32
 INPUT_HIDDEN=128
-REQUIRE_OFFICIAL_MAMBA=1
+REQUIRE_OFFICIAL_MAMBA=auto
 ```
 
-For a CPU-only smoke test, set `REQUIRE_OFFICIAL_MAMBA=0`; this uses a lightweight fallback mixer only to verify the pipeline.
+`REQUIRE_OFFICIAL_MAMBA=auto` uses official `mamba_ssm` when it is available and falls back to a lightweight state mixer when Kaggle cannot build `causal-conv1d` or `mamba-ssm`. Set it to `1` only when the official wheels install cleanly in your environment.

@@ -1,6 +1,7 @@
 import os
 import sys
 import random
+import importlib.util
 from datetime import datetime
 from typing import Dict
 
@@ -66,6 +67,20 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 def save_model_state(model: torch.nn.Module, path: str) -> None:
     torch.save(unwrap_model(model).state_dict(), path)
+
+
+def resolve_mamba_mode() -> tuple[bool, str]:
+    requested = os.environ.get("REQUIRE_OFFICIAL_MAMBA", "auto").strip().lower()
+    mamba_available = importlib.util.find_spec("mamba_ssm") is not None
+    if requested in {"1", "true", "yes", "official"}:
+        if mamba_available:
+            return True, "official mamba_ssm"
+        return False, "fallback mixer (mamba_ssm is unavailable in this environment)"
+    if requested in {"0", "false", "no", "fallback"}:
+        return False, "fallback mixer (requested by REQUIRE_OFFICIAL_MAMBA)"
+    if mamba_available:
+        return True, "official mamba_ssm (auto-detected)"
+    return False, "fallback mixer (auto: mamba_ssm not installed)"
 
 
 def build_dataloaders(train_dataset, valid_dataset, test_dataset, batch_size: int) -> tuple:
@@ -332,14 +347,14 @@ def main() -> None:
     mixer_layers = 1
     mamba_state_dim = 16
     shared_drop_rate = 0.15
-    require_official_mamba = os.environ.get("REQUIRE_OFFICIAL_MAMBA", "1") == "1"
+    require_official_mamba, mamba_mode = resolve_mamba_mode()
 
     print("[Config] MOSI SSMI / 128-d modality projection / Shared Selective State Mixer / TMoEs / 4-token direct prediction")
     print(
         f"[Config] input_hidden={input_hidden} sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
         f"token_reg={token_reg_weight:.3f} mixer_reg={shared_mixer_reg_weight:.3f} shared_aux={shared_aux_weight:.3f} "
-        f"shared_drop={shared_drop_rate:.2f} mamba_state={mamba_state_dim} require_mamba={require_official_mamba} | ckpt=MAE>Corr"
+        f"shared_drop={shared_drop_rate:.2f} mamba_state={mamba_state_dim} mixer={mamba_mode} | ckpt=MAE>Corr"
     )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
