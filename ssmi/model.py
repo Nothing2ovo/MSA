@@ -1,11 +1,17 @@
 import math
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from shared_mamba import SharedSelectiveStateMixer
+
+
+def _mask_sequence(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    if mask is None:
+        return x
+    return x * mask.unsqueeze(-1).to(dtype=x.dtype, device=x.device)
 
 
 class ModalityInputProjector(nn.Module):
@@ -75,8 +81,15 @@ class AttentionPool(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        attn = torch.softmax(self.score(x).squeeze(-1), dim=1)
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores = self.score(x).squeeze(-1)
+        if mask is not None:
+            mask = mask.to(device=x.device, dtype=torch.bool)
+            scores = scores.masked_fill(~mask, -1e4)
+        attn = torch.softmax(scores, dim=1)
+        if mask is not None:
+            attn = attn * mask.to(attn.dtype)
+            attn = attn / attn.sum(dim=1, keepdim=True).clamp_min(1e-8)
         pooled = torch.sum(attn.unsqueeze(-1) * x, dim=1)
         return pooled, attn
 
@@ -96,9 +109,14 @@ class TransformerExpert(nn.Module):
         self.pool = AttentionPool(input_dim, hidden_dim=max(64, input_dim), dropout=dropout)
         self.norm = nn.LayerNorm(input_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.encoder(x)
-        pooled, _ = self.pool(z)
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        key_padding_mask = None
+        if mask is not None:
+            mask = mask.to(device=x.device, dtype=torch.bool)
+            key_padding_mask = ~mask
+        z = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        z = _mask_sequence(z, mask)
+        pooled, _ = self.pool(z, mask=mask)
         return self.norm(pooled)
 
 
@@ -115,8 +133,8 @@ class SparseTMoE(nn.Module):
         ])
         self.norm = nn.LayerNorm(input_dim)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        gate_input, gate_attn = self.gate_pool(x)
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        gate_input, gate_attn = self.gate_pool(x, mask=mask)
         gate_logits = self.gate(gate_input)
 
         # AMP/DataParallel-safe routing: compute sparse softmax in float32 and
@@ -130,7 +148,7 @@ class SparseTMoE(nn.Module):
         gate_mask = torch.zeros_like(gate_logits_fp32)
         gate_mask.scatter_(1, top_idx, 1.0)
 
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
+        expert_outputs = torch.stack([expert(x, mask=mask) for expert in self.experts], dim=1)
         mixed = torch.sum(gate_probs.to(expert_outputs.dtype).unsqueeze(-1) * expert_outputs, dim=1)
         mixed = self.norm(mixed)
 
@@ -454,7 +472,25 @@ class DHMModel(nn.Module):
         )
         self.token_fusion_block = TokenTransformerBlock(token_dim=fusion_dim, num_heads=num_heads, dropout=dropout)
         self.fusion_norm = nn.LayerNorm(fusion_dim)
+        self.text_anchor_pool = AttentionPool(conv_hidden, hidden_dim=max(64, conv_hidden), dropout=dropout)
+        self.mosi_fusion = nn.Sequential(
+            nn.Linear(fusion_dim + conv_hidden, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+        )
+        self.pred_gate = nn.Sequential(
+            nn.Linear(fusion_dim + conv_hidden, max(32, fusion_dim // 2)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(32, fusion_dim // 2), 1),
+            nn.Sigmoid(),
+        )
         self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
+        self.text_anchor_head = RegressionHead(conv_hidden, hidden_dim=fusion_dim, dropout=dropout)
 
     def _build_shared(self, c: torch.Tensor, core_encoder: nn.Module, residual_encoder: nn.Module) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         core = core_encoder(c)
@@ -462,30 +498,74 @@ class DHMModel(nn.Module):
         shared = core + self.shared_residual_scale * residual
         return shared, core, residual
 
-    def forward(self, text: torch.Tensor, vision: torch.Tensor, audio: torch.Tensor):
+    @staticmethod
+    def _resolve_mask(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            mask = x.detach().abs().sum(dim=-1) > 1e-6
+        else:
+            mask = mask.to(device=x.device, dtype=torch.bool)
+        empty = mask.sum(dim=1) == 0
+        if empty.any():
+            mask = mask.clone()
+            mask[empty] = True
+        return mask
+
+    def forward(
+        self,
+        text: torch.Tensor,
+        vision: torch.Tensor,
+        audio: torch.Tensor,
+        text_mask: Optional[torch.Tensor] = None,
+        vision_mask: Optional[torch.Tensor] = None,
+        audio_mask: Optional[torch.Tensor] = None,
+    ):
+        text_mask = self._resolve_mask(text, text_mask)
+        vision_mask = self._resolve_mask(vision, vision_mask)
+        audio_mask = self._resolve_mask(audio, audio_mask)
+
         text = self.text_input_proj(text)
         vision = self.vision_input_proj(vision)
         audio = self.audio_input_proj(audio)
+        text = _mask_sequence(text, text_mask)
+        vision = _mask_sequence(vision, vision_mask)
+        audio = _mask_sequence(audio, audio_mask)
 
-        c_t = self.text_conv(text)
-        c_v = self.vision_conv(vision)
-        c_a = self.audio_conv(audio)
+        c_t = _mask_sequence(self.text_conv(text), text_mask)
+        c_v = _mask_sequence(self.vision_conv(vision), vision_mask)
+        c_a = _mask_sequence(self.audio_conv(audio), audio_mask)
 
         e_irr_t, e_irr_core_t, e_irr_res_t = self._build_shared(c_t, self.shared_core_t, self.shared_res_t)
         e_irr_v, e_irr_core_v, e_irr_res_v = self._build_shared(c_v, self.shared_core_v, self.shared_res_v)
         e_irr_a, e_irr_core_a, e_irr_res_a = self._build_shared(c_a, self.shared_core_a, self.shared_res_a)
+        e_irr_t = _mask_sequence(e_irr_t, text_mask)
+        e_irr_v = _mask_sequence(e_irr_v, vision_mask)
+        e_irr_a = _mask_sequence(e_irr_a, audio_mask)
+        e_irr_core_t = _mask_sequence(e_irr_core_t, text_mask)
+        e_irr_core_v = _mask_sequence(e_irr_core_v, vision_mask)
+        e_irr_core_a = _mask_sequence(e_irr_core_a, audio_mask)
+        e_irr_res_t = _mask_sequence(e_irr_res_t, text_mask)
+        e_irr_res_v = _mask_sequence(e_irr_res_v, vision_mask)
+        e_irr_res_a = _mask_sequence(e_irr_res_a, audio_mask)
 
         e_spe_t = self.private_t(c_t)
         e_spe_v = self.private_v(c_v)
         e_spe_a = self.private_a(c_a)
+        e_spe_t = _mask_sequence(e_spe_t, text_mask)
+        e_spe_v = _mask_sequence(e_spe_v, vision_mask)
+        e_spe_a = _mask_sequence(e_spe_a, audio_mask)
 
         rec_t = self.decoder_t(torch.cat([e_irr_t, e_spe_t], dim=-1))
         rec_v = self.decoder_v(torch.cat([e_irr_v, e_spe_v], dim=-1))
         rec_a = self.decoder_a(torch.cat([e_irr_a, e_spe_a], dim=-1))
+        rec_t = _mask_sequence(rec_t, text_mask)
+        rec_v = _mask_sequence(rec_v, vision_mask)
+        rec_a = _mask_sequence(rec_a, audio_mask)
 
         shared_sequences = torch.stack([e_irr_t, e_irr_v, e_irr_a], dim=1)
+        shared_masks = torch.stack([text_mask, vision_mask, audio_mask], dim=1)
         shared_repr, shared_mixer_aux = self.shared_mixer(
             shared_sequences,
+            modality_masks=shared_masks,
             drop_rate=0.0,
             deterministic_drop=False,
         )
@@ -501,18 +581,27 @@ class DHMModel(nn.Module):
         shared_proj_aug = F.normalize(self.shared_proj_head(shared_repr_aug), dim=-1)
         shared_pred = self.shared_aux_head(shared_repr)
 
-        p_t, tmoe_t_aux = self.tmoe_t(e_spe_t)
-        p_v, tmoe_v_aux = self.tmoe_v(e_spe_v)
-        p_a, tmoe_a_aux = self.tmoe_a(e_spe_a)
+        p_t, tmoe_t_aux = self.tmoe_t(e_spe_t, mask=text_mask)
+        p_v, tmoe_v_aux = self.tmoe_v(e_spe_v, mask=vision_mask)
+        p_a, tmoe_a_aux = self.tmoe_a(e_spe_a, mask=audio_mask)
 
         weighted_tokens, token_fusion_aux = self.token_weighting(shared_repr, p_t, p_v, p_a)
         fused_tokens, fusion_attn = self.token_fusion_block(weighted_tokens)
         token_weights = token_fusion_aux["token_weights"]
         fused_repr = torch.sum(fused_tokens * token_weights.unsqueeze(-1), dim=1)
         fused_repr = self.fusion_norm(fused_repr)
-        pred = self.regressor(fused_repr)
+        text_anchor, text_anchor_attn = self.text_anchor_pool(c_t, mask=text_mask)
+        fusion_context = torch.cat([fused_repr, text_anchor], dim=-1)
+        mosi_repr = self.mosi_fusion(fusion_context)
+        fusion_pred = self.regressor(mosi_repr)
+        text_pred = self.text_anchor_head(text_anchor)
+        pred_gate = self.pred_gate(fusion_context).squeeze(-1)
+        pred = pred_gate * fusion_pred + (1.0 - pred_gate) * text_pred
 
         aux = {
+            "text_mask": text_mask,
+            "vision_mask": vision_mask,
+            "audio_mask": audio_mask,
             "c_t": c_t,
             "c_v": c_v,
             "c_a": c_a,
@@ -544,6 +633,12 @@ class DHMModel(nn.Module):
             "weighted_tokens": weighted_tokens,
             "fused_tokens": fused_tokens,
             "fused_repr": fused_repr,
+            "mosi_repr": mosi_repr,
+            "text_anchor": text_anchor,
+            "text_anchor_attn": text_anchor_attn,
+            "fusion_pred": fusion_pred,
+            "text_pred": text_pred,
+            "pred_gate": pred_gate,
             "shared_mixer_aux": shared_mixer_aux,
             "shared_mixer_aux_aug": shared_mixer_aux_aug,
             "tmoe_t_aux": tmoe_t_aux,

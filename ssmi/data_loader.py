@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 
 
 class MOSIDataset(Dataset):
-    def __init__(self, text, vision, audio, labels):
+    def __init__(self, text, vision, audio, labels, text_mask=None):
         self.text = torch.as_tensor(text, dtype=torch.float32)
         self.vision = torch.as_tensor(vision, dtype=torch.float32)
         self.audio = torch.as_tensor(audio, dtype=torch.float32)
@@ -16,7 +16,14 @@ class MOSIDataset(Dataset):
         self.vision = torch.nan_to_num(self.vision, nan=0.0, posinf=0.0, neginf=0.0)
         self.audio = torch.nan_to_num(self.audio, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self.text_mask = self._build_mask(self.text)
+        if text_mask is None:
+            self.text_mask = self._build_mask(self.text)
+        else:
+            self.text_mask = torch.as_tensor(text_mask, dtype=torch.bool)
+            empty = self.text_mask.sum(dim=1) == 0
+            if empty.any():
+                self.text_mask = self.text_mask.clone()
+                self.text_mask[empty] = True
         self.vision_mask = self._build_mask(self.vision)
         self.audio_mask = self._build_mask(self.audio)
 
@@ -96,12 +103,19 @@ def load_mosi_from_pkl(data_path):
             "vision": torch.as_tensor(split["vision"], dtype=torch.float32),
             "audio": torch.as_tensor(split["audio"], dtype=torch.float32),
             "labels": split["regression_labels"],
+            "text_mask": None,
         }
+        if "text_bert" in split:
+            text_bert = torch.as_tensor(split["text_bert"])
+            if text_bert.dim() == 3 and text_bert.size(1) >= 2:
+                splits[split_name]["text_mask"] = text_bert[:, 1, :].bool()
         for key in ["text", "vision", "audio"]:
             splits[split_name][key] = torch.nan_to_num(splits[split_name][key], nan=0.0, posinf=0.0, neginf=0.0)
 
     train_text, train_vision, train_audio = splits["train"]["text"], splits["train"]["vision"], splits["train"]["audio"]
-    t_mask = MOSIDataset._build_mask(train_text)
+    t_mask = splits["train"]["text_mask"]
+    if t_mask is None:
+        t_mask = MOSIDataset._build_mask(train_text)
     v_mask = MOSIDataset._build_mask(train_vision)
     a_mask = MOSIDataset._build_mask(train_audio)
 
@@ -111,21 +125,24 @@ def load_mosi_from_pkl(data_path):
 
     for split_name, clip_map in [("train", (4.0, 3.5, 3.5)), ("valid", (4.0, 3.5, 3.5)), ("test", (4.0, 3.5, 3.5))]:
         s = splits[split_name]
-        s_t_mask = MOSIDataset._build_mask(s["text"])
+        s_t_mask = s["text_mask"]
+        if s_t_mask is None:
+            s_t_mask = MOSIDataset._build_mask(s["text"])
         s_v_mask = MOSIDataset._build_mask(s["vision"])
         s_a_mask = MOSIDataset._build_mask(s["audio"])
+        s["text_mask"] = s_t_mask
         s["text"] = _normalize(s["text"], s_t_mask, t_mean, t_std, clip_map[0])
         s["vision"] = _normalize(s["vision"], s_v_mask, v_mean, v_std, clip_map[1])
         s["audio"] = _normalize(s["audio"], s_a_mask, a_mean, a_std, clip_map[2])
 
     train_dataset = MOSIDataset(
-        splits["train"]["text"], splits["train"]["vision"], splits["train"]["audio"], splits["train"]["labels"]
+        splits["train"]["text"], splits["train"]["vision"], splits["train"]["audio"], splits["train"]["labels"], splits["train"]["text_mask"]
     )
     valid_dataset = MOSIDataset(
-        splits["valid"]["text"], splits["valid"]["vision"], splits["valid"]["audio"], splits["valid"]["labels"]
+        splits["valid"]["text"], splits["valid"]["vision"], splits["valid"]["audio"], splits["valid"]["labels"], splits["valid"]["text_mask"]
     )
     test_dataset = MOSIDataset(
-        splits["test"]["text"], splits["test"]["vision"], splits["test"]["audio"], splits["test"]["labels"]
+        splits["test"]["text"], splits["test"]["vision"], splits["test"]["audio"], splits["test"]["labels"], splits["test"]["text_mask"]
     )
 
     meta = {

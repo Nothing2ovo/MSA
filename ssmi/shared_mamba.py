@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,10 +22,30 @@ class AttentionPool(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        attn = torch.softmax(self.score(x).squeeze(-1), dim=1)
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores = self.score(x).squeeze(-1)
+        if mask is not None:
+            mask = mask.to(device=x.device, dtype=torch.bool)
+            scores = scores.masked_fill(~mask, -1e4)
+        attn = torch.softmax(scores, dim=1)
+        if mask is not None:
+            attn = attn * mask.to(attn.dtype)
+            attn = attn / attn.sum(dim=1, keepdim=True).clamp_min(1e-8)
         pooled = torch.sum(attn.unsqueeze(-1) * x, dim=1)
         return pooled, attn
+
+
+def _mask_sequence(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    if mask is None:
+        return x
+    return x * mask.unsqueeze(-1).to(device=x.device, dtype=x.dtype)
+
+
+def _masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor], dim: int) -> torch.Tensor:
+    if mask is None:
+        return x.mean(dim=dim)
+    weight = mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
+    return (x * weight).sum(dim=dim) / weight.sum(dim=dim).clamp_min(1.0)
 
 
 class GlobalLocalContextExtractor(nn.Module):
@@ -357,6 +377,7 @@ class SharedSelectiveStateMixer(nn.Module):
     def forward(
         self,
         shared_seq: torch.Tensor,
+        modality_masks: Optional[torch.Tensor] = None,
         drop_rate: float = 0.0,
         deterministic_drop: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -365,10 +386,23 @@ class SharedSelectiveStateMixer(nn.Module):
             raise ValueError("SharedSelectiveStateMixer expects [B, 3, T, D] shared features.")
         if seq_len > self.max_seq_len:
             raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}.")
+        if modality_masks is not None:
+            modality_masks = modality_masks.to(device=shared_seq.device, dtype=torch.bool)
+            if modality_masks.shape != (batch_size, num_modalities, seq_len):
+                raise ValueError(
+                    f"modality_masks must have shape {(batch_size, num_modalities, seq_len)}, "
+                    f"got {tuple(modality_masks.shape)}"
+                )
+            empty = modality_masks.sum(dim=-1) == 0
+            if empty.any():
+                modality_masks = modality_masks.clone()
+                modality_masks[empty] = True
 
         x = self.input_proj(shared_seq)
         x = x + self.modality_embed + self.time_embed[:, :, :seq_len]
+        x = _mask_sequence(x, modality_masks)
         x = self._apply_token_drop(x, drop_rate=drop_rate, deterministic=deterministic_drop)
+        x = _mask_sequence(x, modality_masks)
 
         cross_means: List[torch.Tensor] = []
         intra_means: List[torch.Tensor] = []
@@ -379,10 +413,12 @@ class SharedSelectiveStateMixer(nn.Module):
         spreads: List[torch.Tensor] = []
         layer_gates: List[torch.Tensor] = []
 
-        text_context, _ = self.text_pool(x[:, 0])
+        text_mask = modality_masks[:, 0] if modality_masks is not None else None
+        text_context, _ = self.text_pool(x[:, 0], mask=text_mask)
         for layer in self.layers:
             x, layer_stats = layer(x, text_context=text_context)
-            text_context, _ = self.text_pool(x[:, 0])
+            x = _mask_sequence(x, modality_masks)
+            text_context, _ = self.text_pool(x[:, 0], mask=text_mask)
 
             cross_mean = layer_stats["cross_select_mean"]
             intra_mean = layer_stats["intra_select_mean"]
@@ -401,13 +437,20 @@ class SharedSelectiveStateMixer(nn.Module):
             spreads.append(spread)
             layer_gates.append(layer_stats["intra_cross_gate_mean"])
 
-        modality_repr = x.mean(dim=2)
+        modality_repr = _masked_mean(x, modality_masks, dim=2)
         modality_score = self.modality_readout(modality_repr).squeeze(-1)
         modality_attn = torch.softmax(modality_score, dim=-1)
         intra_summary = torch.sum(modality_attn.unsqueeze(-1) * modality_repr, dim=1)
 
         cross_tokens = x.permute(0, 2, 1, 3).reshape(batch_size, seq_len * 3, self.hidden_dim)
-        cross_token_attn = torch.softmax(self.token_readout(cross_tokens).squeeze(-1), dim=1)
+        cross_scores = self.token_readout(cross_tokens).squeeze(-1)
+        if modality_masks is not None:
+            cross_mask = modality_masks.permute(0, 2, 1).reshape(batch_size, seq_len * 3)
+            cross_scores = cross_scores.masked_fill(~cross_mask, -1e4)
+        cross_token_attn = torch.softmax(cross_scores, dim=1)
+        if modality_masks is not None:
+            cross_token_attn = cross_token_attn * cross_mask.to(cross_token_attn.dtype)
+            cross_token_attn = cross_token_attn / cross_token_attn.sum(dim=1, keepdim=True).clamp_min(1e-8)
         cross_summary = torch.sum(cross_token_attn.unsqueeze(-1) * cross_tokens, dim=1)
 
         intra_summary = self.intra_proj(intra_summary)

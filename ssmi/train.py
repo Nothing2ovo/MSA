@@ -333,7 +333,7 @@ def main() -> None:
     mamba_state_dim = int(os.environ.get("MAMBA_STATE_DIM", "16"))
     shared_drop_rate = float(os.environ.get("SHARED_DROP_RATE", "0.15"))
 
-    print("[Config] MOSI with MOSEI-equivalent official-Mamba SSM / 128-d input projection / TMoEs / 4-token direct prediction")
+    print("[Config] MOSI official-Mamba SSM / 128-d input projection / mask-aware TMoEs / 4-token fusion + text-anchor head")
     print(
         f"[Config] input_hidden={input_hidden} sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
