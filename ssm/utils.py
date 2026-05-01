@@ -22,6 +22,9 @@ DEFAULT_ACC7_LOSS_WEIGHT = 0.06
 DEFAULT_SUPCON_TEMPERATURE = 0.20
 DEFAULT_UNSUPCON_TEMPERATURE = 0.20
 DEFAULT_SHARED_AUX_WEIGHT = 0.10
+DEFAULT_ORTH_WEIGHT = 0.03
+DEFAULT_SHARED_ALIGN_WEIGHT = 0.02
+DEFAULT_PRIVATE_DIV_WEIGHT = 0.005
 
 
 def _safe_neg_fill_value(x: torch.Tensor) -> float:
@@ -371,6 +374,57 @@ def shared_auxiliary_loss(aux: Dict[str, torch.Tensor], labels: torch.Tensor) ->
     return F.smooth_l1_loss(shared_pred.view(-1), labels.view(-1))
 
 
+def _matched_cosine_square(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    dim = min(x.size(-1), y.size(-1))
+    x = F.normalize(x[..., :dim].float(), dim=-1)
+    y = F.normalize(y[..., :dim].float(), dim=-1)
+    return torch.sum(x * y, dim=-1).pow(2).mean()
+
+
+def shared_private_disentanglement_losses(aux: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+    shared_t = aux["e_irr_t"].float()
+    shared_v = aux["e_irr_v"].float()
+    shared_a = aux["e_irr_a"].float()
+    private_t = aux["e_spe_t"].float()
+    private_v = aux["e_spe_v"].float()
+    private_a = aux["e_spe_a"].float()
+
+    orth_loss = (
+        _matched_cosine_square(shared_t, private_t)
+        + _matched_cosine_square(shared_v, private_v)
+        + _matched_cosine_square(shared_a, private_a)
+    ) / 3.0
+
+    pooled_shared = [
+        F.normalize(shared_t.mean(dim=1), dim=-1),
+        F.normalize(shared_v.mean(dim=1), dim=-1),
+        F.normalize(shared_a.mean(dim=1), dim=-1),
+    ]
+    shared_center = F.normalize(sum(pooled_shared) / len(pooled_shared), dim=-1)
+    shared_align_loss = sum(
+        1.0 - F.cosine_similarity(s, shared_center, dim=-1).mean()
+        for s in pooled_shared
+    ) / len(pooled_shared)
+
+    pooled_private = [
+        F.normalize(private_t.mean(dim=1), dim=-1),
+        F.normalize(private_v.mean(dim=1), dim=-1),
+        F.normalize(private_a.mean(dim=1), dim=-1),
+    ]
+    private_div_loss = (
+        F.cosine_similarity(pooled_private[0], pooled_private[1], dim=-1).pow(2).mean()
+        + F.cosine_similarity(pooled_private[0], pooled_private[2], dim=-1).pow(2).mean()
+        + F.cosine_similarity(pooled_private[1], pooled_private[2], dim=-1).pow(2).mean()
+    ) / 3.0
+
+    stats = {
+        "orth_loss": float(orth_loss.item()),
+        "shared_align_loss": float(shared_align_loss.item()),
+        "private_div_loss": float(private_div_loss.item()),
+    }
+    return orth_loss, shared_align_loss, private_div_loss, stats
+
+
 def task_loss_regression(preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(preds.view(-1), labels.view(-1))
 
@@ -409,6 +463,9 @@ def total_loss(
     shared_aux_weight: float = DEFAULT_SHARED_AUX_WEIGHT,
     acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
     acc7_loss_weight: float = DEFAULT_ACC7_LOSS_WEIGHT,
+    orth_weight: float = DEFAULT_ORTH_WEIGHT,
+    shared_align_weight: float = DEFAULT_SHARED_ALIGN_WEIGHT,
+    private_div_weight: float = DEFAULT_PRIVATE_DIV_WEIGHT,
 ):
     l_task = task_loss_regression(preds, labels)
     l_s = similarity_loss(aux, labels, margin=sim_margin)
@@ -421,6 +478,12 @@ def total_loss(
     l_shared_mixer, shared_mixer_stats = shared_mixer_structure_loss(aux)
     l_shared_aux = shared_auxiliary_loss(aux, labels)
     l_acc5, l_acc7 = classification_aux_losses(preds, labels)
+    l_orth, l_shared_align, l_private_div, disentangle_stats = shared_private_disentanglement_losses(aux)
+    l_disentangle = (
+        orth_weight * l_orth
+        + shared_align_weight * l_shared_align
+        + private_div_weight * l_private_div
+    )
 
     total = (
         l_task
@@ -434,6 +497,7 @@ def total_loss(
         + shared_aux_weight * l_shared_aux
         + acc5_loss_weight * l_acc5
         + acc7_loss_weight * l_acc7
+        + l_disentangle
     )
 
     fusion_attn = aux["fusion_attn"]
@@ -471,6 +535,8 @@ def total_loss(
         "unsupcon_loss": _dp_reduce_scalar(l_unsup),
         "shared_mixer_reg_loss": shared_mixer_stats["shared_mixer_reg_loss"],
         "shared_aux_loss": _dp_reduce_scalar(l_shared_aux),
+        "disentangle_loss": _dp_reduce_scalar(l_disentangle),
+        **disentangle_stats,
         "acc5_loss": _dp_reduce_scalar(l_acc5),
         "acc7_loss": _dp_reduce_scalar(l_acc7),
         "total_loss": _dp_reduce_scalar(total),
@@ -525,6 +591,9 @@ def evaluate(
     shared_aux_weight: float = DEFAULT_SHARED_AUX_WEIGHT,
     acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
     acc7_loss_weight: float = DEFAULT_ACC7_LOSS_WEIGHT,
+    orth_weight: float = DEFAULT_ORTH_WEIGHT,
+    shared_align_weight: float = DEFAULT_SHARED_ALIGN_WEIGHT,
+    private_div_weight: float = DEFAULT_PRIVATE_DIV_WEIGHT,
     use_amp: bool = False,
 ):
     model.eval()
@@ -540,6 +609,10 @@ def evaluate(
         "token_reg_loss": 0.0,
         "shared_mixer_reg_loss": 0.0,
         "shared_aux_loss": 0.0,
+        "disentangle_loss": 0.0,
+        "orth_loss": 0.0,
+        "shared_align_loss": 0.0,
+        "private_div_loss": 0.0,
         "acc5_loss": 0.0,
         "acc7_loss": 0.0,
         "token_entropy": 0.0,
@@ -606,6 +679,9 @@ def evaluate(
                 shared_aux_weight=shared_aux_weight,
                 acc5_loss_weight=acc5_loss_weight,
                 acc7_loss_weight=acc7_loss_weight,
+                orth_weight=orth_weight,
+                shared_align_weight=shared_align_weight,
+                private_div_weight=private_div_weight,
             )
 
         batch_size = labels.size(0)
@@ -621,6 +697,10 @@ def evaluate(
         totals["token_reg_loss"] += stats["token_reg_loss"] * batch_size
         totals["shared_mixer_reg_loss"] += stats["shared_mixer_reg_loss"] * batch_size
         totals["shared_aux_loss"] += stats["shared_aux_loss"] * batch_size
+        totals["disentangle_loss"] += stats["disentangle_loss"] * batch_size
+        totals["orth_loss"] += stats["orth_loss"] * batch_size
+        totals["shared_align_loss"] += stats["shared_align_loss"] * batch_size
+        totals["private_div_loss"] += stats["private_div_loss"] * batch_size
         totals["acc5_loss"] += stats["acc5_loss"] * batch_size
         totals["acc7_loss"] += stats["acc7_loss"] * batch_size
         totals["token_entropy"] += stats["token_entropy"] * batch_size
@@ -663,6 +743,10 @@ def evaluate(
         "token_reg_loss": totals["token_reg_loss"] / max(1, total_samples),
         "shared_mixer_reg_loss": totals["shared_mixer_reg_loss"] / max(1, total_samples),
         "shared_aux_loss": totals["shared_aux_loss"] / max(1, total_samples),
+        "disentangle_loss": totals["disentangle_loss"] / max(1, total_samples),
+        "orth_loss": totals["orth_loss"] / max(1, total_samples),
+        "shared_align_loss": totals["shared_align_loss"] / max(1, total_samples),
+        "private_div_loss": totals["private_div_loss"] / max(1, total_samples),
         "acc5_loss": totals["acc5_loss"] / max(1, total_samples),
         "acc7_loss": totals["acc7_loss"] / max(1, total_samples),
         "token_entropy": totals["token_entropy"] / max(1, total_samples),
@@ -673,7 +757,9 @@ def evaluate(
             for key, value in totals.items()
             if key not in {
                 "loss", "task", "sim", "recon", "moe", "supcon", "unsupcon",
-                "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "acc5_loss", "acc7_loss", "token_entropy", "token_balance", "token_max_weight"
+                "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss",
+                "disentangle_loss", "orth_loss", "shared_align_loss", "private_div_loss",
+                "acc5_loss", "acc7_loss", "token_entropy", "token_balance", "token_max_weight"
             }
         },
     }
@@ -698,6 +784,9 @@ def train_one_epoch(
     shared_aux_weight: float = DEFAULT_SHARED_AUX_WEIGHT,
     acc5_loss_weight: float = DEFAULT_ACC5_LOSS_WEIGHT,
     acc7_loss_weight: float = DEFAULT_ACC7_LOSS_WEIGHT,
+    orth_weight: float = DEFAULT_ORTH_WEIGHT,
+    shared_align_weight: float = DEFAULT_SHARED_ALIGN_WEIGHT,
+    private_div_weight: float = DEFAULT_PRIVATE_DIV_WEIGHT,
     scaler: torch.amp.GradScaler | None = None,
     use_amp: bool = False,
 ):
@@ -714,6 +803,10 @@ def train_one_epoch(
         "token_reg": 0.0,
         "shared_mixer_reg": 0.0,
         "shared_aux_loss": 0.0,
+        "disentangle_loss": 0.0,
+        "orth_loss": 0.0,
+        "shared_align_loss": 0.0,
+        "private_div_loss": 0.0,
         "acc5_loss": 0.0,
         "acc7_loss": 0.0,
         "token_entropy": 0.0,
@@ -750,6 +843,9 @@ def train_one_epoch(
                 shared_aux_weight=shared_aux_weight,
                 acc5_loss_weight=acc5_loss_weight,
                 acc7_loss_weight=acc7_loss_weight,
+                orth_weight=orth_weight,
+                shared_align_weight=shared_align_weight,
+                private_div_weight=private_div_weight,
             )
 
         if scaler is not None and use_amp:
@@ -775,6 +871,10 @@ def train_one_epoch(
         totals["token_reg"] += stats["token_reg_loss"] * batch_size
         totals["shared_mixer_reg"] += stats["shared_mixer_reg_loss"] * batch_size
         totals["shared_aux_loss"] += stats["shared_aux_loss"] * batch_size
+        totals["disentangle_loss"] += stats["disentangle_loss"] * batch_size
+        totals["orth_loss"] += stats["orth_loss"] * batch_size
+        totals["shared_align_loss"] += stats["shared_align_loss"] * batch_size
+        totals["private_div_loss"] += stats["private_div_loss"] * batch_size
         totals["acc5_loss"] += stats["acc5_loss"] * batch_size
         totals["acc7_loss"] += stats["acc7_loss"] * batch_size
         totals["token_entropy"] += stats["token_entropy"] * batch_size
@@ -794,6 +894,10 @@ def train_one_epoch(
         "train_token_reg_loss": totals["token_reg"] / max(1, total_samples),
         "train_shared_mixer_reg_loss": totals["shared_mixer_reg"] / max(1, total_samples),
         "train_shared_aux_loss": totals["shared_aux_loss"] / max(1, total_samples),
+        "train_disentangle_loss": totals["disentangle_loss"] / max(1, total_samples),
+        "train_orth_loss": totals["orth_loss"] / max(1, total_samples),
+        "train_shared_align_loss": totals["shared_align_loss"] / max(1, total_samples),
+        "train_private_div_loss": totals["private_div_loss"] / max(1, total_samples),
         "train_acc5_loss": totals["acc5_loss"] / max(1, total_samples),
         "train_acc7_loss": totals["acc7_loss"] / max(1, total_samples),
         "train_token_entropy": totals["token_entropy"] / max(1, total_samples),

@@ -189,6 +189,8 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
         f"  token reg    : {metrics['token_reg_loss']:.4f}",
         f"  mixer reg    : {metrics['shared_mixer_reg_loss']:.4f}",
         f"  shared aux   : {metrics['shared_aux_loss']:.4f}",
+        f"  disentangle  : {metrics['disentangle_loss']:.4f}",
+        f"    orth/align/div: {metrics['orth_loss']:.4f} / {metrics['shared_align_loss']:.4f} / {metrics['private_div_loss']:.4f}",
         f"  token entropy: {metrics['token_entropy']:.4f}",
         f"  token maxw   : {metrics['token_max_weight']:.4f}",
         f"  cls5/cls7    : {metrics['acc5_loss']:.4f} / {metrics['acc7_loss']:.4f}",
@@ -235,7 +237,8 @@ def print_epoch_summary(
         f"moe={train_stats['train_moe_loss']:.4f} supcon={train_stats['train_supcon_loss']:.4f} "
         f"unsupcon={train_stats['train_unsupcon_loss']:.4f} token_reg={train_stats['train_token_reg_loss']:.4f} "
         f"mixer_reg={train_stats['train_shared_mixer_reg_loss']:.4f} cls5={train_stats['train_acc5_loss']:.4f} "
-        f"shared_aux={train_stats['train_shared_aux_loss']:.4f} cls7={train_stats['train_acc7_loss']:.4f}"
+        f"shared_aux={train_stats['train_shared_aux_loss']:.4f} disent={train_stats['train_disentangle_loss']:.4f} "
+        f"cls7={train_stats['train_acc7_loss']:.4f}"
     )
     print(
         f"  valid MAE/Corr  = {valid_metrics['MAE']:.4f} / {valid_metrics['Corr']:.4f} | "
@@ -247,7 +250,12 @@ def print_epoch_summary(
         f"  valid losses    = total {valid_metrics['total_loss']:.4f} | task {valid_metrics['task_loss']:.4f} | "
         f"sim {valid_metrics['sim_loss']:.4f} | recon {valid_metrics['recon_loss']:.4f} | "
         f"moe {valid_metrics['moe_loss']:.4f} | supcon {valid_metrics['supcon_loss']:.4f} | "
-        f"unsupcon {valid_metrics['unsupcon_loss']:.4f} | mixer {valid_metrics['shared_mixer_reg_loss']:.4f} | shared_aux {valid_metrics['shared_aux_loss']:.4f}"
+        f"unsupcon {valid_metrics['unsupcon_loss']:.4f} | mixer {valid_metrics['shared_mixer_reg_loss']:.4f} | "
+        f"shared_aux {valid_metrics['shared_aux_loss']:.4f} | disent {valid_metrics['disentangle_loss']:.4f}"
+    )
+    print(
+        f"  disentangle    = orth {valid_metrics['orth_loss']:.4f} | "
+        f"shared_align {valid_metrics['shared_align_loss']:.4f} | private_div {valid_metrics['private_div_loss']:.4f}"
     )
     print(
         f"  4-token detail  = entropy {valid_metrics['token_entropy']:.4f} | prior-fit {valid_metrics['token_balance']:.4f} | "
@@ -281,25 +289,28 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    batch_size = int(os.environ.get("BATCH_SIZE", "32"))
-    num_epochs = int(os.environ.get("EPOCHS", "50"))
-    learning_rate = float(os.environ.get("LR", "1e-4"))
-    weight_decay = float(os.environ.get("WEIGHT_DECAY", "1e-4"))
-    patience = int(os.environ.get("PATIENCE", "10"))
-    grad_clip = float(os.environ.get("GRAD_CLIP", "1.0"))
+    batch_size = 32
+    num_epochs = 30
+    learning_rate = 6e-5
+    weight_decay = 1e-4
+    patience = 8
+    grad_clip = 1.0
 
-    sim_weight = float(os.environ.get("SIM_WEIGHT", "0.02"))
-    recon_weight = float(os.environ.get("RECON_WEIGHT", "0.05"))
-    moe_weight = float(os.environ.get("MOE_WEIGHT", "0.10"))
-    supcon_weight = float(os.environ.get("SUPCON_WEIGHT", "0.02"))
-    unsupcon_weight = float(os.environ.get("UNSUPCON_WEIGHT", "0.01"))
-    sim_margin = float(os.environ.get("SIM_MARGIN", "0.20"))
+    sim_weight = 0.02
+    recon_weight = 0.05
+    moe_weight = 0.10
+    supcon_weight = 0.01
+    unsupcon_weight = 0.003
+    sim_margin = 0.20
 
-    token_reg_weight = float(os.environ.get("TOKEN_REG_WEIGHT", "0.04"))
-    shared_mixer_reg_weight = float(os.environ.get("MIXER_REG_WEIGHT", "0.030"))
-    shared_aux_weight = float(os.environ.get("SHARED_AUX_WEIGHT", "0.10"))
-    acc5_loss_weight = float(os.environ.get("ACC5_LOSS_WEIGHT", "0.10"))
-    acc7_loss_weight = float(os.environ.get("ACC7_LOSS_WEIGHT", "0.06"))
+    token_reg_weight = 0.04
+    shared_mixer_reg_weight = 0.05
+    shared_aux_weight = 0.10
+    acc5_loss_weight = 0.10
+    acc7_loss_weight = 0.06
+    orth_weight = 0.03
+    shared_align_weight = 0.02
+    private_div_weight = 0.005
 
     dropout = 0.50
     conv_hidden = 128
@@ -319,6 +330,7 @@ def main() -> None:
         f"[Config] sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
         f"token_reg={token_reg_weight:.3f} mixer_reg={shared_mixer_reg_weight:.3f} shared_aux={shared_aux_weight:.3f} "
+        f"orth={orth_weight:.3f} shared_align={shared_align_weight:.3f} private_div={private_div_weight:.3f} "
         f"shared_drop={shared_drop_rate:.2f} mamba_state={mamba_state_dim} | ckpt=MAE>Corr"
     )
 
@@ -416,6 +428,9 @@ def main() -> None:
             shared_aux_weight=shared_aux_weight,
             acc5_loss_weight=acc5_loss_weight,
             acc7_loss_weight=acc7_loss_weight,
+            orth_weight=orth_weight,
+            shared_align_weight=shared_align_weight,
+            private_div_weight=private_div_weight,
             scaler=scaler,
             use_amp=use_amp,
         )
@@ -434,6 +449,9 @@ def main() -> None:
             shared_aux_weight=shared_aux_weight,
             acc5_loss_weight=acc5_loss_weight,
             acc7_loss_weight=acc7_loss_weight,
+            orth_weight=orth_weight,
+            shared_align_weight=shared_align_weight,
+            private_div_weight=private_div_weight,
             use_amp=use_amp,
         )
         score = model_selection_score(valid_metrics)
@@ -505,6 +523,9 @@ def main() -> None:
         shared_aux_weight=shared_aux_weight,
         acc5_loss_weight=acc5_loss_weight,
         acc7_loss_weight=acc7_loss_weight,
+        orth_weight=orth_weight,
+        shared_align_weight=shared_align_weight,
+        private_div_weight=private_div_weight,
         use_amp=use_amp,
     )
     final_test = evaluate(
@@ -517,15 +538,18 @@ def main() -> None:
         shared_aux_weight=shared_aux_weight,
         acc5_loss_weight=acc5_loss_weight,
         acc7_loss_weight=acc7_loss_weight,
+        orth_weight=orth_weight,
+        shared_align_weight=shared_align_weight,
+        private_div_weight=private_div_weight,
         use_amp=use_amp,
     )
 
     print("\n========== Final Validation ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "acc5_loss", "acc7_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "disentangle_loss", "orth_loss", "shared_align_loss", "private_div_loss", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_valid[k]:.4f}")
 
     print("\n========== Final Test ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "acc5_loss", "acc7_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "disentangle_loss", "orth_loss", "shared_align_loss", "private_div_loss", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_test[k]:.4f}")
 
     save_final_test_results(RESULTS_FILE, final_test)
