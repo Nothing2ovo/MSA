@@ -525,6 +525,9 @@ def total_loss(
     fused_repr = _as_float_tensor(aux["fused_repr"])
     if fused_repr.dim() > 2:
         fused_repr = fused_repr.reshape(-1, fused_repr.shape[-1])
+    shared_pred = _as_float_tensor(aux["shared_pred"]).view(-1)
+    private_delta = _as_float_tensor(aux["private_delta"]).view(-1)
+    labels_flat = labels.view(-1).float()
 
     stats = {
         "task_loss": _dp_reduce_scalar(l_task),
@@ -540,6 +543,9 @@ def total_loss(
         "acc5_loss": _dp_reduce_scalar(l_acc5),
         "acc7_loss": _dp_reduce_scalar(l_acc7),
         "total_loss": _dp_reduce_scalar(total),
+        "shared_pred_mae": _dp_reduce_scalar(torch.abs(shared_pred - labels_flat).mean()),
+        "private_delta_abs_mean": _dp_reduce_scalar(private_delta.abs().mean()),
+        "private_delta_signed_mean": _dp_reduce_scalar(private_delta.mean()),
         **token_stats,
         "cross_select_mean": _dp_reduce_scalar(shared_mixer_aux["cross_select_mean"]),
         "intra_select_mean": _dp_reduce_scalar(shared_mixer_aux["intra_select_mean"]),
@@ -561,10 +567,9 @@ def total_loss(
         "token_weight_vision": _dp_reduce_scalar(token_weights[:, 2].mean()),
         "token_weight_audio": _dp_reduce_scalar(token_weights[:, 3].mean()),
         "token_dominance_margin": token_stats["token_dominance_margin"],
-        "attn_shared_to_shared": _dp_reduce_scalar(fusion_attn[:, 0, 0].mean()),
-        "attn_shared_to_text": _dp_reduce_scalar(fusion_attn[:, 0, 1].mean()),
-        "attn_shared_to_vision": _dp_reduce_scalar(fusion_attn[:, 0, 2].mean()),
-        "attn_shared_to_audio": _dp_reduce_scalar(fusion_attn[:, 0, 3].mean()),
+        "attn_text_to_text": _dp_reduce_scalar(fusion_attn[:, 0, 0].mean()),
+        "attn_text_to_vision": _dp_reduce_scalar(fusion_attn[:, 0, 1].mean()),
+        "attn_text_to_audio": _dp_reduce_scalar(fusion_attn[:, 0, 2].mean()),
         "gate_t_mean": _dp_reduce_scalar(gate_t_probs.max(dim=-1).values.mean()),
         "gate_v_mean": _dp_reduce_scalar(gate_v_probs.max(dim=-1).values.mean()),
         "gate_a_mean": _dp_reduce_scalar(gate_a_probs.max(dim=-1).values.mean()),
@@ -640,15 +645,17 @@ def evaluate(
         "token_weight_vision": 0.0,
         "token_weight_audio": 0.0,
         "token_dominance_margin": 0.0,
-        "attn_shared_to_shared": 0.0,
-        "attn_shared_to_text": 0.0,
-        "attn_shared_to_vision": 0.0,
-        "attn_shared_to_audio": 0.0,
+        "attn_text_to_text": 0.0,
+        "attn_text_to_vision": 0.0,
+        "attn_text_to_audio": 0.0,
         "gate_t_mean": 0.0,
         "gate_v_mean": 0.0,
         "gate_a_mean": 0.0,
         "shared_view_gap": 0.0,
         "fused_repr_norm": 0.0,
+        "shared_pred_mae": 0.0,
+        "private_delta_abs_mean": 0.0,
+        "private_delta_signed_mean": 0.0,
     }
     all_preds = []
     all_labels = []
@@ -716,9 +723,9 @@ def evaluate(
             "late_std_preserve_penalty", "late_spread_preserve_penalty",
             "modality_attn_t", "modality_attn_v", "modality_attn_a",
             "token_weight_shared", "token_weight_text", "token_weight_vision", "token_weight_audio", "token_dominance_margin",
-            "attn_shared_to_shared", "attn_shared_to_text", "attn_shared_to_vision", "attn_shared_to_audio",
+            "attn_text_to_text", "attn_text_to_vision", "attn_text_to_audio",
             "gate_t_mean", "gate_v_mean", "gate_a_mean",
-            "shared_view_gap", "fused_repr_norm",
+            "shared_view_gap", "fused_repr_norm", "shared_pred_mae", "private_delta_abs_mean", "private_delta_signed_mean",
         ]:
             totals[key] += stats[key] * batch_size
 
@@ -752,6 +759,9 @@ def evaluate(
         "token_entropy": totals["token_entropy"] / max(1, total_samples),
         "token_balance": totals["token_balance"] / max(1, total_samples),
         "token_max_weight": totals["token_max_weight"] / max(1, total_samples),
+        "shared_pred_mae": totals["shared_pred_mae"] / max(1, total_samples),
+        "private_delta_abs_mean": totals["private_delta_abs_mean"] / max(1, total_samples),
+        "private_delta_signed_mean": totals["private_delta_signed_mean"] / max(1, total_samples),
         "analysis": {
             key: value / max(1, total_samples)
             for key, value in totals.items()
@@ -759,7 +769,8 @@ def evaluate(
                 "loss", "task", "sim", "recon", "moe", "supcon", "unsupcon",
                 "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss",
                 "disentangle_loss", "orth_loss", "shared_align_loss", "private_div_loss",
-                "acc5_loss", "acc7_loss", "token_entropy", "token_balance", "token_max_weight"
+                "acc5_loss", "acc7_loss", "token_entropy", "token_balance", "token_max_weight",
+                "shared_pred_mae", "private_delta_abs_mean", "private_delta_signed_mean"
             }
         },
     }
@@ -814,6 +825,9 @@ def train_one_epoch(
         "token_max_weight": 0.0,
         "token_floor_penalty": 0.0,
         "token_peak_penalty": 0.0,
+        "shared_pred_mae": 0.0,
+        "private_delta_abs_mean": 0.0,
+        "private_delta_signed_mean": 0.0,
     }
 
     amp_device = "cuda" if device.type == "cuda" else "cpu"
@@ -882,6 +896,9 @@ def train_one_epoch(
         totals["token_max_weight"] += stats["token_max_weight"] * batch_size
         totals["token_floor_penalty"] += stats["token_floor_penalty"] * batch_size
         totals["token_peak_penalty"] += stats["token_peak_penalty"] * batch_size
+        totals["shared_pred_mae"] += stats["shared_pred_mae"] * batch_size
+        totals["private_delta_abs_mean"] += stats["private_delta_abs_mean"] * batch_size
+        totals["private_delta_signed_mean"] += stats["private_delta_signed_mean"] * batch_size
 
     return {
         "train_total_loss": totals["loss"] / max(1, total_samples),
@@ -905,4 +922,7 @@ def train_one_epoch(
         "train_token_max_weight": totals["token_max_weight"] / max(1, total_samples),
         "train_token_floor_penalty": totals["token_floor_penalty"] / max(1, total_samples),
         "train_token_peak_penalty": totals["token_peak_penalty"] / max(1, total_samples),
+        "train_shared_pred_mae": totals["shared_pred_mae"] / max(1, total_samples),
+        "train_private_delta_abs_mean": totals["private_delta_abs_mean"] / max(1, total_samples),
+        "train_private_delta_signed_mean": totals["private_delta_signed_mean"] / max(1, total_samples),
     }

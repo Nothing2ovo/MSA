@@ -152,7 +152,7 @@ class TokenLevelDynamicWeighting(nn.Module):
         shared_min_weight: float = 0.18,
         private_min_weight: float = 0.05,
         gate_scale: float = 0.45,
-        shared_to_private_scale: float = 0.06,
+        shared_to_private_scale: float = 0.0,
     ):
         super().__init__()
         self.temperature = max(1e-3, float(temperature))
@@ -278,8 +278,7 @@ class TokenLevelDynamicWeighting(nn.Module):
         token_weights = token_weights + 0.30 * under_floor
         token_weights = token_weights / token_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
-        guided_tokens = typed_tokens.clone()
-        guided_tokens[:, 1:, :] = guided_tokens[:, 1:, :] + self.shared_to_private_scale * shared_anchor.unsqueeze(1)
+        guided_tokens = typed_tokens
 
         token_scale = 1.0 + self.gate_scale * (token_weights - prior_dist)
         token_scale = token_scale.clamp(min=0.90, max=1.25)
@@ -357,7 +356,7 @@ class DHMModel(nn.Module):
            -> Shared Selective State Mixer on shared branch
            -> Transformer experts / TMoEs on private branches
            -> 4-token dynamic fusion
-           -> direct sentiment prediction
+           -> shared-primary prediction + bounded private residual
     """
 
     def __init__(
@@ -440,7 +439,8 @@ class DHMModel(nn.Module):
         )
         self.token_fusion_block = TokenTransformerBlock(token_dim=fusion_dim, num_heads=num_heads, dropout=dropout)
         self.fusion_norm = nn.LayerNorm(fusion_dim)
-        self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
+        self.private_residual_scale = 0.30
+        self.private_residual_head = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
 
     def _build_shared(self, c: torch.Tensor, core_encoder: nn.Module, residual_encoder: nn.Module) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         core = core_encoder(c)
@@ -485,11 +485,16 @@ class DHMModel(nn.Module):
         p_a, tmoe_a_aux = self.tmoe_a(e_spe_a)
 
         weighted_tokens, token_fusion_aux = self.token_weighting(shared_repr, p_t, p_v, p_a)
-        fused_tokens, fusion_attn = self.token_fusion_block(weighted_tokens)
         token_weights = token_fusion_aux["token_weights"]
-        fused_repr = torch.sum(fused_tokens * token_weights.unsqueeze(-1), dim=1)
+        private_tokens = weighted_tokens[:, 1:, :]
+        private_token_weights = token_weights[:, 1:]
+        private_token_weights = private_token_weights / private_token_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        fused_tokens, fusion_attn = self.token_fusion_block(private_tokens)
+        fused_repr = torch.sum(fused_tokens * private_token_weights.unsqueeze(-1), dim=1)
         fused_repr = self.fusion_norm(fused_repr)
-        pred = self.regressor(fused_repr)
+        private_delta_raw = self.private_residual_head(fused_repr)
+        private_delta = self.private_residual_scale * torch.tanh(private_delta_raw)
+        pred = shared_pred + private_delta
 
         aux = {
             "c_t": c_t,
@@ -523,6 +528,10 @@ class DHMModel(nn.Module):
             "weighted_tokens": weighted_tokens,
             "fused_tokens": fused_tokens,
             "fused_repr": fused_repr,
+            "private_token_weights": private_token_weights,
+            "private_delta_raw": private_delta_raw,
+            "private_delta": private_delta,
+            "private_residual_scale": torch.tensor(self.private_residual_scale, device=pred.device, dtype=pred.dtype),
             "shared_mixer_aux": shared_mixer_aux,
             "shared_mixer_aux_aug": shared_mixer_aux_aug,
             "tmoe_t_aux": tmoe_t_aux,

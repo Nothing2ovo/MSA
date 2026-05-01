@@ -191,6 +191,8 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
         f"  shared aux   : {metrics['shared_aux_loss']:.4f}",
         f"  disentangle  : {metrics['disentangle_loss']:.4f}",
         f"    orth/align/div: {metrics['orth_loss']:.4f} / {metrics['shared_align_loss']:.4f} / {metrics['private_div_loss']:.4f}",
+        f"  shared mae   : {metrics['shared_pred_mae']:.4f}",
+        f"  private delta: abs {metrics['private_delta_abs_mean']:.4f} | signed {metrics['private_delta_signed_mean']:.4f}",
         f"  token entropy: {metrics['token_entropy']:.4f}",
         f"  token maxw   : {metrics['token_max_weight']:.4f}",
         f"  cls5/cls7    : {metrics['acc5_loss']:.4f} / {metrics['acc7_loss']:.4f}",
@@ -256,6 +258,12 @@ def print_epoch_summary(
     print(
         f"  disentangle    = orth {valid_metrics['orth_loss']:.4f} | "
         f"shared_align {valid_metrics['shared_align_loss']:.4f} | private_div {valid_metrics['private_div_loss']:.4f}"
+    )
+    print(
+        f"  residual path  = train shared_mae {train_stats['train_shared_pred_mae']:.4f} | "
+        f"train delta_abs {train_stats['train_private_delta_abs_mean']:.4f} | "
+        f"valid shared_mae {valid_metrics['shared_pred_mae']:.4f} | "
+        f"valid delta_abs {valid_metrics['private_delta_abs_mean']:.4f}"
     )
     print(
         f"  4-token detail  = entropy {valid_metrics['token_entropy']:.4f} | prior-fit {valid_metrics['token_balance']:.4f} | "
@@ -545,11 +553,11 @@ def main() -> None:
     )
 
     print("\n========== Final Validation ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "disentangle_loss", "orth_loss", "shared_align_loss", "private_div_loss", "acc5_loss", "acc7_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "disentangle_loss", "orth_loss", "shared_align_loss", "private_div_loss", "shared_pred_mae", "private_delta_abs_mean", "private_delta_signed_mean", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_valid[k]:.4f}")
 
     print("\n========== Final Test ==========")
-    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "disentangle_loss", "orth_loss", "shared_align_loss", "private_div_loss", "acc5_loss", "acc7_loss"]:
+    for k in ["MAE", "Corr", "Acc2_nonneg", "F1_nonneg", "Acc2_posneg", "F1_posneg", "Acc5", "Acc7", "total_loss", "supcon_loss", "unsupcon_loss", "token_reg_loss", "shared_mixer_reg_loss", "shared_aux_loss", "disentangle_loss", "orth_loss", "shared_align_loss", "private_div_loss", "shared_pred_mae", "private_delta_abs_mean", "private_delta_signed_mean", "acc5_loss", "acc7_loss"]:
         print(f"{k:<14}: {final_test[k]:.4f}")
 
     save_final_test_results(RESULTS_FILE, final_test)
