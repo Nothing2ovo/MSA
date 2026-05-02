@@ -203,7 +203,7 @@ class TokenLevelDynamicWeighting(nn.Module):
             nn.Linear(token_dim, 1),
         )
         self.shared_affinity_proj = nn.Linear(token_dim, token_dim)
-        base_prior = torch.tensor([0.22, 0.14, 0.12, 0.22, 0.15, 0.15], dtype=torch.float32)
+        base_prior = torch.tensor([0.20, 0.16, 0.14, 0.18, 0.16, 0.16], dtype=torch.float32)
         self.register_buffer("base_prior_logits", torch.log(base_prior))
         self.register_buffer("token_bias", torch.zeros(self.num_tokens, dtype=torch.float32))
         self.out_norm = nn.LayerNorm(token_dim)

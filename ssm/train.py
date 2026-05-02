@@ -265,6 +265,8 @@ def print_epoch_summary(
     print(
         f"  mixer          = intra {valid_metrics['analysis']['intra_select_mean']:.4f} | "
         f"select_std {valid_metrics['analysis']['select_std']:.4f} | spread {valid_metrics['analysis']['select_spread']:.4f} | "
+        f"shared cos {valid_metrics['analysis']['shared_token_pair_cos']:.4f} | "
+        f"bal {valid_metrics['analysis']['shared_modality_balance_penalty']:.4f} | "
         f"6tok ts/vs/as/tp/vp/ap "
         f"{valid_metrics['analysis']['token_weight_t_shared']:.4f} / {valid_metrics['analysis']['token_weight_v_shared']:.4f} / "
         f"{valid_metrics['analysis']['token_weight_a_shared']:.4f} / {valid_metrics['analysis']['token_weight_t_private']:.4f} / "

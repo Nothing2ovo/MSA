@@ -272,6 +272,26 @@ def shared_mixer_structure_loss(
     intra_std_pen = weighted_mean(F.relu(target_intra_std - per_layer_intra_std))
     spread_pen = weighted_mean(F.relu(min_select_spread - per_layer_spread))
 
+    shared_tokens = _as_float_tensor(aux.get("shared_tokens", shared_mixer_aux["shared_tokens"]))
+    shared_tokens_n = F.normalize(shared_tokens, dim=-1)
+    t_shared = shared_tokens_n[:, 0]
+    v_shared = shared_tokens_n[:, 1]
+    a_shared = shared_tokens_n[:, 2]
+    pair_cos = torch.stack([
+        F.cosine_similarity(t_shared, v_shared, dim=-1),
+        F.cosine_similarity(t_shared, a_shared, dim=-1),
+        F.cosine_similarity(v_shared, a_shared, dim=-1),
+    ], dim=1)
+    shared_align_pen = F.relu(0.35 - pair_cos).mean()
+    shared_collapse_pen = F.relu(pair_cos - 0.92).mean()
+
+    modality_attn = _dp_reduce_matrix_lastdim(shared_mixer_aux["modality_attn"])
+    uniform_attn = torch.full_like(modality_attn.mean(dim=0), 1.0 / modality_attn.size(1))
+    modality_balance_pen = F.mse_loss(modality_attn.mean(dim=0), uniform_attn)
+
+    token_norms = shared_tokens.float().norm(dim=-1).mean(dim=0)
+    norm_balance_pen = ((token_norms / token_norms.mean().clamp_min(1e-8)) - 1.0).pow(2).mean()
+
     if num_layers > 1:
         next_select_std = per_layer_select_std[1:]
         prev_select_std = per_layer_select_std[:-1]
@@ -287,6 +307,10 @@ def shared_mixer_structure_loss(
         1.15 * select_std_pen
         + 0.70 * intra_std_pen
         + 1.10 * spread_pen
+        + 0.45 * shared_align_pen
+        + 0.30 * shared_collapse_pen
+        + 0.35 * modality_balance_pen
+        + 0.05 * norm_balance_pen
         + 0.18 * late_std_preserve_pen
         + 0.18 * late_spread_preserve_pen
     )
@@ -305,6 +329,11 @@ def shared_mixer_structure_loss(
         "multi_layer_select_spread": float(per_layer_spread.mean().item()),
         "late_std_preserve_penalty": float(late_std_preserve_pen.item()),
         "late_spread_preserve_penalty": float(late_spread_preserve_pen.item()),
+        "shared_token_pair_cos": float(pair_cos.mean().item()),
+        "shared_token_align_penalty": float(shared_align_pen.item()),
+        "shared_token_collapse_penalty": float(shared_collapse_pen.item()),
+        "shared_modality_balance_penalty": float(modality_balance_pen.item()),
+        "shared_token_norm_balance_penalty": float(norm_balance_pen.item()),
     }
     return loss, stats
 
@@ -326,7 +355,7 @@ def token_regularization_loss(
     mean_w = token_weights.mean(dim=0)
     if num_tokens == 6:
         target_prior = torch.tensor(
-            [0.22, 0.14, 0.12, 0.22, 0.15, 0.15],
+            [0.20, 0.16, 0.14, 0.18, 0.16, 0.16],
             device=token_weights.device,
             dtype=token_weights.dtype,
         )
@@ -608,6 +637,11 @@ def total_loss(
         "multi_layer_select_spread": shared_mixer_stats["multi_layer_select_spread"],
         "late_std_preserve_penalty": shared_mixer_stats["late_std_preserve_penalty"],
         "late_spread_preserve_penalty": shared_mixer_stats["late_spread_preserve_penalty"],
+        "shared_token_pair_cos": shared_mixer_stats["shared_token_pair_cos"],
+        "shared_token_align_penalty": shared_mixer_stats["shared_token_align_penalty"],
+        "shared_token_collapse_penalty": shared_mixer_stats["shared_token_collapse_penalty"],
+        "shared_modality_balance_penalty": shared_mixer_stats["shared_modality_balance_penalty"],
+        "shared_token_norm_balance_penalty": shared_mixer_stats["shared_token_norm_balance_penalty"],
         "modality_attn_t": _dp_reduce_scalar(modality_attn[:, 0].mean()),
         "modality_attn_v": _dp_reduce_scalar(modality_attn[:, 1].mean()),
         "modality_attn_a": _dp_reduce_scalar(modality_attn[:, 2].mean()),
@@ -693,6 +727,11 @@ def evaluate(
         "multi_layer_select_spread": 0.0,
         "late_std_preserve_penalty": 0.0,
         "late_spread_preserve_penalty": 0.0,
+        "shared_token_pair_cos": 0.0,
+        "shared_token_align_penalty": 0.0,
+        "shared_token_collapse_penalty": 0.0,
+        "shared_modality_balance_penalty": 0.0,
+        "shared_token_norm_balance_penalty": 0.0,
         "modality_attn_t": 0.0,
         "modality_attn_v": 0.0,
         "modality_attn_a": 0.0,
@@ -781,6 +820,8 @@ def evaluate(
             "cross_select_std", "intra_select_std", "select_std", "cross_intra_gap", "select_spread",
             "multi_layer_select_std", "multi_layer_cross_intra_gap", "multi_layer_select_spread",
             "late_std_preserve_penalty", "late_spread_preserve_penalty",
+            "shared_token_pair_cos", "shared_token_align_penalty", "shared_token_collapse_penalty",
+            "shared_modality_balance_penalty", "shared_token_norm_balance_penalty",
             "modality_attn_t", "modality_attn_v", "modality_attn_a",
             "token_weight_t_shared", "token_weight_v_shared", "token_weight_a_shared",
             "token_weight_t_private", "token_weight_v_private", "token_weight_a_private",

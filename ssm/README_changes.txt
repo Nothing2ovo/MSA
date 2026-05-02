@@ -27,6 +27,9 @@ Current experimental variant:
    text-private / vision-private / audio-private.
 4. Cross-modal interaction is now concentrated in the downstream token-level
    Transformer fusion, while Mamba focuses on continuous intra-modal dynamics.
+5. The 6-token prior is rebalanced to reduce text-private dominance, and the
+   shared mixer regularizer now constrains refined shared-token alignment,
+   anti-collapse, modality-attention balance, and token-norm balance.
 
 Core model path:
 Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token fusion -> sentiment prediction.
