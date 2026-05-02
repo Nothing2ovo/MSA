@@ -22,8 +22,8 @@ BASE_DIR = PROJECT_ROOT
 PLOTS_DIR = os.path.join(BASE_DIR, "plots")
 RESULTS_FILE = os.path.join(BASE_DIR, "results", "final_test_results.txt")
 MODEL_DIR = os.path.join(BASE_DIR, "model file")
-BEST_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhib_4token_direct_pred.pt")
-BEST_MAE_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhib_4token_mae_ref.pt")
+BEST_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhib_6token_intra_mamba.pt")
+BEST_MAE_MODEL_FILE = os.path.join(MODEL_DIR, "best_dhib_6token_intra_mamba_mae_ref.pt")
 DATA_FILE = os.path.join(BASE_DIR, "data", "aligned_50e.pkl")
 
 
@@ -154,19 +154,19 @@ def plot_training_curves(history: Dict[str, list], save_dir: str = PLOTS_DIR) ->
     plt.close()
 
     plt.figure(figsize=(10, 6))
-    plt.plot(epochs, history["cross_select_mean"], label="cross select mean")
     plt.plot(epochs, history["intra_select_mean"], label="intra select mean")
     plt.plot(epochs, history["select_std"], label="select std")
-    plt.plot(epochs, history["cross_intra_gap"], label="cross/intra gap")
-    plt.plot(epochs, history["token_weight_shared"], label="token weight shared")
-    plt.plot(epochs, history["token_weight_text"], label="token weight text")
-    plt.plot(epochs, history["token_weight_vision"], label="token weight vision")
-    plt.plot(epochs, history["token_weight_audio"], label="token weight audio")
+    plt.plot(epochs, history["token_weight_t_shared"], label="t shared")
+    plt.plot(epochs, history["token_weight_v_shared"], label="v shared")
+    plt.plot(epochs, history["token_weight_a_shared"], label="a shared")
+    plt.plot(epochs, history["token_weight_t_private"], label="t private")
+    plt.plot(epochs, history["token_weight_v_private"], label="v private")
+    plt.plot(epochs, history["token_weight_a_private"], label="a private")
     plt.plot(epochs, history["token_entropy"], label="token entropy")
     plt.plot(epochs, history["token_max_weight"], label="token max weight")
     plt.xlabel("Epoch")
     plt.ylabel("Value")
-    plt.title("Structure and 4-Token Metrics")
+    plt.title("Intra-Mamba Structure and 6-Token Metrics")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "structure_token_metrics.png"))
@@ -258,14 +258,17 @@ def print_epoch_summary(
         f"shared_align {valid_metrics['shared_align_loss']:.4f} | private_div {valid_metrics['private_div_loss']:.4f}"
     )
     print(
-        f"  4-token detail  = entropy {valid_metrics['token_entropy']:.4f} | prior-fit {valid_metrics['token_balance']:.4f} | "
+        f"  6-token detail  = entropy {valid_metrics['token_entropy']:.4f} | prior-fit {valid_metrics['token_balance']:.4f} | "
         f"maxw {valid_metrics['token_max_weight']:.4f} | dom {valid_metrics['analysis']['token_dominance_margin']:.4f} | "
         f"floor {valid_metrics['analysis']['token_floor_penalty']:.4f} | peak {valid_metrics['analysis']['token_peak_penalty']:.4f}"
     )
     print(
-        f"  mixer          = cross/intra {valid_metrics['analysis']['cross_select_mean']:.4f} / {valid_metrics['analysis']['intra_select_mean']:.4f} | "
-        f"select_std {valid_metrics['analysis']['select_std']:.4f} | gap {valid_metrics['analysis']['cross_intra_gap']:.4f} | spread {valid_metrics['analysis']['select_spread']:.4f} | "
-        f"token s/t/v/a {valid_metrics['analysis']['token_weight_shared']:.4f} / {valid_metrics['analysis']['token_weight_text']:.4f} / {valid_metrics['analysis']['token_weight_vision']:.4f} / {valid_metrics['analysis']['token_weight_audio']:.4f}"
+        f"  mixer          = intra {valid_metrics['analysis']['intra_select_mean']:.4f} | "
+        f"select_std {valid_metrics['analysis']['select_std']:.4f} | spread {valid_metrics['analysis']['select_spread']:.4f} | "
+        f"6tok ts/vs/as/tp/vp/ap "
+        f"{valid_metrics['analysis']['token_weight_t_shared']:.4f} / {valid_metrics['analysis']['token_weight_v_shared']:.4f} / "
+        f"{valid_metrics['analysis']['token_weight_a_shared']:.4f} / {valid_metrics['analysis']['token_weight_t_private']:.4f} / "
+        f"{valid_metrics['analysis']['token_weight_v_private']:.4f} / {valid_metrics['analysis']['token_weight_a_private']:.4f}"
     )
     print(
         f"  shared CL       = sup {valid_metrics['supcon_loss']:.4f} | unsup {valid_metrics['unsupcon_loss']:.4f} | "
@@ -325,7 +328,7 @@ def main() -> None:
     mamba_state_dim = 16
     shared_drop_rate = 0.15
 
-    print("[Config] shared-residual decoupling / Shared Selective State Mixer(official Mamba) / TMoEs / 4-token direct prediction")
+    print("[Config] shared-residual decoupling / intra-modal Shared Selective State Mixer(official Mamba) / TMoEs / 6-token direct prediction")
     print(
         f"[Config] sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
@@ -371,7 +374,7 @@ def main() -> None:
         dropout=dropout,
         shared_drop_rate=shared_drop_rate,
         shared_residual_scale=0.20,
-        use_shared_cross_attention=True,
+        use_shared_cross_attention=False,
         require_official_mamba=True,
     ).to(device)
     model, parallel_mode = maybe_wrap_dataparallel(model, device)
@@ -398,14 +401,18 @@ def main() -> None:
         "valid_f1_posneg": [],
         "valid_acc5": [],
         "valid_acc7": [],
-        "cross_select_mean": [],
         "intra_select_mean": [],
+        "token_weight_t_shared": [],
+        "token_weight_v_shared": [],
+        "token_weight_a_shared": [],
+        "token_weight_t_private": [],
+        "token_weight_v_private": [],
+        "token_weight_a_private": [],
         "token_weight_shared": [],
         "token_weight_text": [],
         "token_weight_vision": [],
         "token_weight_audio": [],
         "select_std": [],
-        "cross_intra_gap": [],
         "token_entropy": [],
         "token_max_weight": [],
     }
@@ -468,14 +475,18 @@ def main() -> None:
         history["valid_f1_posneg"].append(valid_metrics["F1_posneg"])
         history["valid_acc5"].append(valid_metrics["Acc5"])
         history["valid_acc7"].append(valid_metrics["Acc7"])
-        history["cross_select_mean"].append(valid_metrics["analysis"]["cross_select_mean"])
         history["intra_select_mean"].append(valid_metrics["analysis"]["intra_select_mean"])
+        history["token_weight_t_shared"].append(valid_metrics["analysis"]["token_weight_t_shared"])
+        history["token_weight_v_shared"].append(valid_metrics["analysis"]["token_weight_v_shared"])
+        history["token_weight_a_shared"].append(valid_metrics["analysis"]["token_weight_a_shared"])
+        history["token_weight_t_private"].append(valid_metrics["analysis"]["token_weight_t_private"])
+        history["token_weight_v_private"].append(valid_metrics["analysis"]["token_weight_v_private"])
+        history["token_weight_a_private"].append(valid_metrics["analysis"]["token_weight_a_private"])
         history["token_weight_shared"].append(valid_metrics["analysis"]["token_weight_shared"])
         history["token_weight_text"].append(valid_metrics["analysis"]["token_weight_text"])
         history["token_weight_vision"].append(valid_metrics["analysis"]["token_weight_vision"])
         history["token_weight_audio"].append(valid_metrics["analysis"]["token_weight_audio"])
         history["select_std"].append(valid_metrics["analysis"]["select_std"])
-        history["cross_intra_gap"].append(valid_metrics["analysis"]["cross_intra_gap"])
         history["token_entropy"].append(valid_metrics["token_entropy"])
         history["token_max_weight"].append(valid_metrics["token_max_weight"])
 

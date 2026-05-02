@@ -149,7 +149,7 @@ class TokenLevelDynamicWeighting(nn.Module):
         temperature: float = 1.10,
         flatten_power: float = 0.97,
         prior_mix: float = 0.14,
-        shared_min_weight: float = 0.18,
+        shared_min_weight: float = 0.06,
         private_min_weight: float = 0.05,
         gate_scale: float = 0.45,
         shared_to_private_scale: float = 0.06,
@@ -162,7 +162,7 @@ class TokenLevelDynamicWeighting(nn.Module):
         self.private_min_weight = float(private_min_weight)
         self.gate_scale = float(gate_scale)
         self.shared_to_private_scale = float(shared_to_private_scale)
-        self.num_tokens = 4
+        self.num_tokens = 6
 
         self.shared_proj = nn.Sequential(
             nn.Linear(shared_dim, token_dim),
@@ -203,28 +203,30 @@ class TokenLevelDynamicWeighting(nn.Module):
             nn.Linear(token_dim, 1),
         )
         self.shared_affinity_proj = nn.Linear(token_dim, token_dim)
-        base_prior = torch.tensor([0.40, 0.28, 0.17, 0.15], dtype=torch.float32)
+        base_prior = torch.tensor([0.22, 0.14, 0.12, 0.22, 0.15, 0.15], dtype=torch.float32)
         self.register_buffer("base_prior_logits", torch.log(base_prior))
         self.register_buffer("token_bias", torch.zeros(self.num_tokens, dtype=torch.float32))
         self.out_norm = nn.LayerNorm(token_dim)
 
     def forward(
         self,
-        shared_repr: torch.Tensor,
+        shared_tokens: torch.Tensor,
         private_t: torch.Tensor,
         private_v: torch.Tensor,
         private_a: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        shared_token = self.shared_proj(shared_repr)
+        shared_tokens = self.shared_proj(shared_tokens)
         t_token = self.private_t_proj(private_t)
         v_token = self.private_v_proj(private_v)
         a_token = self.private_a_proj(private_a)
 
-        raw_tokens = torch.stack([shared_token, t_token, v_token, a_token], dim=1)
+        private_tokens_raw = torch.stack([t_token, v_token, a_token], dim=1)
+        raw_tokens = torch.cat([shared_tokens, private_tokens_raw], dim=1)
         typed_tokens = raw_tokens + self.token_type_embed
 
-        shared_anchor = typed_tokens[:, 0, :]
-        private_tokens = typed_tokens[:, 1:, :]
+        shared_group = typed_tokens[:, :3, :]
+        private_tokens = typed_tokens[:, 3:, :]
+        shared_anchor = shared_group.mean(dim=1)
         private_mean = private_tokens.mean(dim=1)
         private_max = private_tokens.amax(dim=1)
         global_ctx = self.context_proj(torch.cat([shared_anchor, private_mean, private_max], dim=-1))
@@ -240,13 +242,18 @@ class TokenLevelDynamicWeighting(nn.Module):
         shared_ref = F.normalize(self.shared_affinity_proj(shared_anchor), dim=-1)
         shared_affinity = torch.sum(F.normalize(typed_tokens, dim=-1) * shared_ref.unsqueeze(1), dim=-1)
 
+        shared_consistency = F.cosine_similarity(
+            shared_group,
+            shared_anchor.unsqueeze(1).expand_as(shared_group),
+            dim=-1,
+        )
         private_consistency = F.cosine_similarity(
             private_tokens,
             private_mean.unsqueeze(1).expand_as(private_tokens),
             dim=-1,
         )
         private_bonus = torch.cat([
-            torch.zeros_like(shared_affinity[:, :1]),
+            0.04 * shared_consistency,
             0.06 * private_consistency,
         ], dim=1)
 
@@ -271,7 +278,14 @@ class TokenLevelDynamicWeighting(nn.Module):
         token_weights = (1.0 - adaptive_prior_mix) * token_weights + adaptive_prior_mix * prior_dist
 
         soft_floor = torch.tensor(
-            [self.shared_min_weight, self.private_min_weight, self.private_min_weight, self.private_min_weight],
+            [
+                self.shared_min_weight,
+                self.shared_min_weight,
+                self.shared_min_weight,
+                self.private_min_weight,
+                self.private_min_weight,
+                self.private_min_weight,
+            ],
             device=token_weights.device,
             dtype=token_weights.dtype,
         ).view(1, -1)
@@ -280,13 +294,17 @@ class TokenLevelDynamicWeighting(nn.Module):
         token_weights = token_weights / token_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         guided_tokens = typed_tokens.clone()
-        guided_tokens[:, 1:, :] = guided_tokens[:, 1:, :] + self.shared_to_private_scale * shared_anchor.unsqueeze(1)
+        guided_tokens[:, :3, :] = guided_tokens[:, :3, :] + 0.5 * self.shared_to_private_scale * private_mean.unsqueeze(1)
+        guided_tokens[:, 3:, :] = guided_tokens[:, 3:, :] + self.shared_to_private_scale * shared_anchor.unsqueeze(1)
 
         token_scale = 1.0 + self.gate_scale * (token_weights - prior_dist)
         token_scale = token_scale.clamp(min=0.90, max=1.25)
         weighted_tokens = self.out_norm(guided_tokens * token_scale.unsqueeze(-1))
 
-        dominance_margin = token_weights[:, 0] - token_weights[:, 1:].max(dim=1).values
+        text_total = token_weights[:, 0] + token_weights[:, 3]
+        vision_total = token_weights[:, 1] + token_weights[:, 4]
+        audio_total = token_weights[:, 2] + token_weights[:, 5]
+        dominance_margin = text_total - torch.stack([vision_total, audio_total], dim=1).max(dim=1).values
         aux = {
             "raw_tokens": raw_tokens,
             "typed_tokens": typed_tokens,
@@ -298,10 +316,17 @@ class TokenLevelDynamicWeighting(nn.Module):
             "prior_dist": prior_dist.expand(token_weights.size(0), -1),
             "adaptive_prior_mix": adaptive_prior_mix.expand(token_weights.size(0), -1),
             "dominance_margin": dominance_margin,
-            "shared_token": shared_token,
+            "text_shared_token": shared_tokens[:, 0, :],
+            "vision_shared_token": shared_tokens[:, 1, :],
+            "audio_shared_token": shared_tokens[:, 2, :],
             "text_token": t_token,
             "vision_token": v_token,
             "audio_token": a_token,
+            "text_total_weight": text_total,
+            "vision_total_weight": vision_total,
+            "audio_total_weight": audio_total,
+            "shared_total_weight": token_weights[:, :3].sum(dim=1),
+            "private_total_weight": token_weights[:, 3:].sum(dim=1),
             "global_context": global_ctx,
         }
         return weighted_tokens, aux
@@ -355,9 +380,9 @@ class RegressionHead(nn.Module):
 class DHMModel(nn.Module):
     """
     Conv1D -> Decoupling(shared/private)
-           -> Shared Selective State Mixer on shared branch
+           -> intra-modal Shared Selective State Mixer on shared branch
            -> Transformer experts / TMoEs on private branches
-           -> 4-token dynamic fusion
+           -> 6-token dynamic fusion
            -> direct sentiment prediction
     """
 
@@ -467,16 +492,18 @@ class DHMModel(nn.Module):
         rec_a = self.decoder_a(torch.cat([e_irr_a, e_spe_a], dim=-1))
 
         shared_sequences = torch.stack([e_irr_t, e_irr_v, e_irr_a], dim=1)
-        shared_repr, shared_mixer_aux = self.shared_mixer(
+        shared_tokens, shared_mixer_aux = self.shared_mixer(
             shared_sequences,
             drop_rate=0.0,
             deterministic_drop=False,
         )
-        shared_repr_aug, shared_mixer_aux_aug = self.shared_mixer(
+        shared_tokens_aug, shared_mixer_aux_aug = self.shared_mixer(
             shared_sequences,
             drop_rate=self.shared_drop_rate,
             deterministic_drop=not self.training,
         )
+        shared_repr = shared_mixer_aux["shared_summary"]
+        shared_repr_aug = shared_mixer_aux_aug["shared_summary"]
         shared_proj = F.normalize(self.shared_proj_head(shared_repr), dim=-1)
         shared_proj_aug = F.normalize(self.shared_proj_head(shared_repr_aug), dim=-1)
         shared_pred = self.shared_aux_head(shared_repr)
@@ -485,7 +512,7 @@ class DHMModel(nn.Module):
         p_v, tmoe_v_aux = self.tmoe_v(e_spe_v)
         p_a, tmoe_a_aux = self.tmoe_a(e_spe_a)
 
-        weighted_tokens, token_fusion_aux = self.token_weighting(shared_repr, p_t, p_v, p_a)
+        weighted_tokens, token_fusion_aux = self.token_weighting(shared_tokens, p_t, p_v, p_a)
         fused_tokens, fusion_attn = self.token_fusion_block(weighted_tokens)
         token_weights = token_fusion_aux["token_weights"]
         fused_repr = torch.sum(fused_tokens * token_weights.unsqueeze(-1), dim=1)
@@ -512,6 +539,8 @@ class DHMModel(nn.Module):
             "rec_v": rec_v,
             "rec_a": rec_a,
             "shared_sequences": shared_sequences,
+            "shared_tokens": shared_tokens,
+            "shared_tokens_aug": shared_tokens_aug,
             "shared_repr": shared_repr,
             "shared_repr_aug": shared_repr_aug,
             "shared_pred": shared_pred,

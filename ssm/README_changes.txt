@@ -16,5 +16,17 @@ Before training:
 python -m pip install -U pip
 python -m pip install "causal-conv1d>=1.4.0" "mamba-ssm>=2.2.2"
 
+Current experimental variant:
+1. SharedSelectiveStateMixer is changed to an intra-modal Mamba mixer only.
+   It scans text/vision/audio shared sequences independently and no longer
+   performs text-centered cross-modal pair scans inside the Mamba branch.
+2. The shared branch now emits three shared tokens:
+   text-shared, vision-shared, and audio-shared.
+3. Final fusion is changed from 4-token fusion to 6-token fusion:
+   text-shared / vision-shared / audio-shared /
+   text-private / vision-private / audio-private.
+4. Cross-modal interaction is now concentrated in the downstream token-level
+   Transformer fusion, while Mamba focuses on continuous intra-modal dynamics.
+
 Core model path:
-Factorized shared/private features -> shared branch: official-Mamba Shared Selective State Mixer -> private branch: Transformer/TMoE experts -> 4-token fusion -> sentiment prediction.
+Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token fusion -> sentiment prediction.

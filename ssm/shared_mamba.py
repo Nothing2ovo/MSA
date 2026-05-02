@@ -147,11 +147,11 @@ class BiDirectionalMamba(nn.Module):
 
 class SharedSelectiveStateMixerLayer(nn.Module):
     """
-    One shared branch layer.
+    One intra-modal shared branch layer.
 
-    Intra path: each modality's shared sequence is scanned independently.
-    Cross path: text-centered language guidance is used to scan [vision, text]
-    and [audio, text] pairs, replacing explicit cross-modal hyperedges.
+    Each modality's shared sequence is scanned independently with bidirectional
+    Mamba. Cross-modal interaction is intentionally deferred to the downstream
+    token-level fusion stage.
     """
 
     def __init__(
@@ -166,47 +166,10 @@ class SharedSelectiveStateMixerLayer(nn.Module):
         require_official_mamba: bool = True,
     ):
         super().__init__()
-        self.use_cross_attention = bool(use_cross_attention)
-
         self.intra_glce = GlobalLocalContextExtractor(hidden_dim, dropout=dropout)
         self.intra_mamba = BiDirectionalMamba(
             hidden_dim, state_dim=state_dim, conv_kernel=conv_kernel, expand=expand,
             dropout=dropout, require_official_mamba=require_official_mamba,
-        )
-        self.text_glce = GlobalLocalContextExtractor(hidden_dim, dropout=dropout)
-        self.text_mamba = BiDirectionalMamba(
-            hidden_dim, state_dim=state_dim, conv_kernel=conv_kernel, expand=expand,
-            dropout=dropout, require_official_mamba=require_official_mamba,
-        )
-        self.vt_glce = GlobalLocalContextExtractor(hidden_dim, dropout=dropout)
-        self.at_glce = GlobalLocalContextExtractor(hidden_dim, dropout=dropout)
-        self.vt_mamba = BiDirectionalMamba(
-            hidden_dim, state_dim=state_dim, conv_kernel=conv_kernel, expand=expand,
-            dropout=dropout, require_official_mamba=require_official_mamba,
-        )
-        self.at_mamba = BiDirectionalMamba(
-            hidden_dim, state_dim=state_dim, conv_kernel=conv_kernel, expand=expand,
-            dropout=dropout, require_official_mamba=require_official_mamba,
-        )
-
-        self.text_context_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        if self.use_cross_attention:
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=num_heads,
-                dropout=dropout,
-                batch_first=True,
-            )
-            self.cross_attn_norm = nn.LayerNorm(hidden_dim)
-        self.intra_cross_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Sigmoid(),
         )
         self.layer_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
@@ -222,7 +185,7 @@ class SharedSelectiveStateMixerLayer(nn.Module):
         reshaped = pair.reshape(pair.size(0), pair.size(1) // 2, 2, pair.size(2))
         return reshaped[:, :, 0, :], reshaped[:, :, 1, :]
 
-    def forward(self, x: torch.Tensor, text_context: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size, num_modalities, seq_len, hidden_dim = x.shape
 
         # Intra-modal shared scan.
@@ -230,44 +193,17 @@ class SharedSelectiveStateMixerLayer(nn.Module):
         intra_in = self.intra_glce(intra_in)
         intra_out, intra_stats = self.intra_mamba(intra_in)
         intra_out = intra_out.view(batch_size, num_modalities, seq_len, hidden_dim)
+        out = self.layer_norm(x + self.dropout(intra_out))
 
-        t = intra_out[:, 0]
-        v = intra_out[:, 1]
-        a = intra_out[:, 2]
-        t_ctx = self.text_context_proj(text_context).unsqueeze(1)
-
-        # Central text scan and text-guided cross-modal pair scans.
-        t_scan, t_stats = self.text_mamba(self.text_glce(t + t_ctx))
-        vt_in = self.vt_glce(self._make_pair_sequence(v, t + t_ctx))
-        at_in = self.at_glce(self._make_pair_sequence(a, t + t_ctx))
-        vt_out, vt_stats = self.vt_mamba(vt_in)
-        at_out, at_stats = self.at_mamba(at_in)
-        v_cross, t_from_v = self._split_pair_sequence(vt_out)
-        a_cross, t_from_a = self._split_pair_sequence(at_out)
-        t_cross = self.layer_norm(t_scan + 0.50 * (t_from_v + t_from_a))
-
-        cross_out = torch.stack([t_cross, v_cross, a_cross], dim=1)
-
-        if self.use_cross_attention:
-            flat = cross_out.permute(0, 2, 1, 3).reshape(batch_size, seq_len * num_modalities, hidden_dim)
-            attn_out, _ = self.cross_attn(flat, flat, flat, need_weights=False)
-            flat = self.cross_attn_norm(flat + self.dropout(attn_out))
-            cross_out = flat.view(batch_size, seq_len, num_modalities, hidden_dim).permute(0, 2, 1, 3)
-
-        gate = self.intra_cross_gate(torch.cat([intra_out, cross_out], dim=-1))
-        out = self.layer_norm(x + self.dropout(gate * cross_out + (1.0 - gate) * intra_out))
-
-        cross_mean = (t_stats["select_mean"] + vt_stats["select_mean"] + at_stats["select_mean"]) / 3.0
-        cross_std = (t_stats["select_std"] + vt_stats["select_std"] + at_stats["select_std"]) / 3.0
-        cross_spread = (t_stats["select_spread"] + vt_stats["select_spread"] + at_stats["select_spread"]) / 3.0
+        zero = intra_stats["select_mean"].new_zeros(())
         stats = {
             "intra_select_mean": intra_stats["select_mean"],
             "intra_select_std": intra_stats["select_std"],
             "intra_select_spread": intra_stats["select_spread"],
-            "cross_select_mean": cross_mean,
-            "cross_select_std": cross_std,
-            "cross_select_spread": cross_spread,
-            "intra_cross_gate_mean": gate.detach().float().mean(),
+            "cross_select_mean": zero,
+            "cross_select_std": zero,
+            "cross_select_spread": zero,
+            "intra_cross_gate_mean": zero,
         }
         return out, stats
 
@@ -277,7 +213,7 @@ class SharedSelectiveStateMixer(nn.Module):
     Official-Mamba shared branch replacement for HypergraphEncoder.
 
     Input:  shared_seq [B, 3, T, node_dim]
-    Output: refined shared token [B, hidden_dim]
+    Output: refined per-modality shared tokens [B, 3, hidden_dim]
     """
 
     def __init__(
@@ -322,14 +258,9 @@ class SharedSelectiveStateMixer(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        self.text_pool = AttentionPool(hidden_dim, hidden_dim=max(64, hidden_dim), dropout=dropout)
         self.modality_readout = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
-        self.token_readout = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
-        self.intra_proj = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU())
-        self.cross_proj = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU())
-        self.fuse_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid()
-        )
+        self.token_proj = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU())
+        self.summary_proj = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU())
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -370,80 +301,59 @@ class SharedSelectiveStateMixer(nn.Module):
         x = x + self.modality_embed + self.time_embed[:, :, :seq_len]
         x = self._apply_token_drop(x, drop_rate=drop_rate, deterministic=deterministic_drop)
 
-        cross_means: List[torch.Tensor] = []
         intra_means: List[torch.Tensor] = []
-        cross_stds: List[torch.Tensor] = []
         intra_stds: List[torch.Tensor] = []
         select_stds: List[torch.Tensor] = []
-        gaps: List[torch.Tensor] = []
         spreads: List[torch.Tensor] = []
-        layer_gates: List[torch.Tensor] = []
+        zero_refs: List[torch.Tensor] = []
 
-        text_context, _ = self.text_pool(x[:, 0])
         for layer in self.layers:
-            x, layer_stats = layer(x, text_context=text_context)
-            text_context, _ = self.text_pool(x[:, 0])
-
-            cross_mean = layer_stats["cross_select_mean"]
+            x, layer_stats = layer(x)
+            zero = layer_stats["cross_select_mean"]
             intra_mean = layer_stats["intra_select_mean"]
-            cross_std = layer_stats["cross_select_std"]
             intra_std = layer_stats["intra_select_std"]
-            select_std = 0.5 * (cross_std + intra_std)
-            gap = cross_mean - intra_mean
-            spread = 0.5 * (layer_stats["cross_select_spread"] + layer_stats["intra_select_spread"])
+            select_std = intra_std
+            spread = layer_stats["intra_select_spread"]
 
-            cross_means.append(cross_mean)
             intra_means.append(intra_mean)
-            cross_stds.append(cross_std)
             intra_stds.append(intra_std)
             select_stds.append(select_std)
-            gaps.append(gap)
             spreads.append(spread)
-            layer_gates.append(layer_stats["intra_cross_gate_mean"])
+            zero_refs.append(zero)
 
         modality_repr = x.mean(dim=2)
+        shared_tokens = self.out_norm(self.token_proj(modality_repr))
         modality_score = self.modality_readout(modality_repr).squeeze(-1)
         modality_attn = torch.softmax(modality_score, dim=-1)
-        intra_summary = torch.sum(modality_attn.unsqueeze(-1) * modality_repr, dim=1)
+        shared_summary = torch.sum(modality_attn.unsqueeze(-1) * shared_tokens, dim=1)
+        shared_summary = self.dropout(self.out_norm(self.summary_proj(shared_summary)))
 
-        cross_tokens = x.permute(0, 2, 1, 3).reshape(batch_size, seq_len * 3, self.hidden_dim)
-        cross_token_attn = torch.softmax(self.token_readout(cross_tokens).squeeze(-1), dim=1)
-        cross_summary = torch.sum(cross_token_attn.unsqueeze(-1) * cross_tokens, dim=1)
-
-        intra_summary = self.intra_proj(intra_summary)
-        cross_summary = self.cross_proj(cross_summary)
-        gate = self.fuse_gate(torch.cat([intra_summary, cross_summary], dim=-1))
-        shared_repr = self.out_norm(gate * cross_summary + (1.0 - gate) * intra_summary)
-        shared_repr = self.dropout(shared_repr)
-
-        per_layer_cross_means = torch.stack(cross_means)
+        per_layer_zeros = torch.stack(zero_refs)
         per_layer_intra_means = torch.stack(intra_means)
-        per_layer_cross_stds = torch.stack(cross_stds)
         per_layer_intra_stds = torch.stack(intra_stds)
         per_layer_select_stds = torch.stack(select_stds)
-        per_layer_gaps = torch.stack(gaps)
         per_layer_spreads = torch.stack(spreads)
-        per_layer_gates = torch.stack(layer_gates)
 
         aux = {
-            "cross_select_mean": per_layer_cross_means.mean(),
+            "cross_select_mean": per_layer_zeros.mean(),
             "intra_select_mean": per_layer_intra_means.mean(),
-            "cross_select_std": per_layer_cross_stds.mean(),
+            "cross_select_std": per_layer_zeros.mean(),
             "intra_select_std": per_layer_intra_stds.mean(),
             "select_std": per_layer_select_stds.mean(),
-            "cross_intra_gap": per_layer_gaps.mean(),
+            "cross_intra_gap": per_layer_zeros.mean(),
             "select_spread": per_layer_spreads.mean(),
-            "per_layer_cross_select_mean": per_layer_cross_means,
+            "per_layer_cross_select_mean": per_layer_zeros,
             "per_layer_intra_select_mean": per_layer_intra_means,
-            "per_layer_cross_select_std": per_layer_cross_stds,
+            "per_layer_cross_select_std": per_layer_zeros,
             "per_layer_intra_select_std": per_layer_intra_stds,
             "per_layer_select_std": per_layer_select_stds,
-            "per_layer_cross_intra_gap": per_layer_gaps,
+            "per_layer_cross_intra_gap": per_layer_zeros,
             "per_layer_select_spread": per_layer_spreads,
-            "per_layer_intra_cross_gate": per_layer_gates,
+            "per_layer_intra_cross_gate": per_layer_zeros,
             "modality_attn": modality_attn,
-            "cross_token_attn": cross_token_attn,
-            "shared_gate_mean": gate.detach().float().mean(),
-            "intra_cross_gate_mean": per_layer_gates.mean(),
+            "shared_summary": shared_summary,
+            "shared_tokens": shared_tokens,
+            "shared_gate_mean": per_layer_zeros.mean(),
+            "intra_cross_gate_mean": per_layer_zeros.mean(),
         }
-        return shared_repr, aux
+        return self.dropout(shared_tokens), aux

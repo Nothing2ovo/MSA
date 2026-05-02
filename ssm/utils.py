@@ -269,9 +269,7 @@ def shared_mixer_structure_loss(
         return torch.sum(layer_weights * x)
 
     select_std_pen = weighted_mean(F.relu(target_select_std - per_layer_select_std))
-    cross_std_pen = weighted_mean(F.relu(target_cross_std - per_layer_cross_std))
     intra_std_pen = weighted_mean(F.relu(target_intra_std - per_layer_intra_std))
-    gap_pen = weighted_mean(F.relu(min_cross_intra_gap - per_layer_gap))
     spread_pen = weighted_mean(F.relu(min_select_spread - per_layer_spread))
 
     if num_layers > 1:
@@ -287,10 +285,8 @@ def shared_mixer_structure_loss(
 
     loss = (
         1.15 * select_std_pen
-        + 0.55 * cross_std_pen
-        + 0.55 * intra_std_pen
+        + 0.70 * intra_std_pen
         + 1.10 * spread_pen
-        + 0.18 * gap_pen
         + 0.18 * late_std_preserve_pen
         + 0.18 * late_spread_preserve_pen
     )
@@ -328,19 +324,48 @@ def token_regularization_loss(
     entropy_penalty = (entropy - target_entropy).pow(2).mean()
 
     mean_w = token_weights.mean(dim=0)
-    target_prior = torch.tensor([0.34, 0.26, 0.21, 0.19], device=token_weights.device, dtype=token_weights.dtype)
+    if num_tokens == 6:
+        target_prior = torch.tensor(
+            [0.22, 0.14, 0.12, 0.22, 0.15, 0.15],
+            device=token_weights.device,
+            dtype=token_weights.dtype,
+        )
+    else:
+        target_prior = torch.tensor(
+            [0.34, 0.26, 0.21, 0.19],
+            device=token_weights.device,
+            dtype=token_weights.dtype,
+        )
     balance = F.mse_loss(mean_w, target_prior)
 
-    shared_w = token_weights[:, 0]
-    text_w = token_weights[:, 1]
-    private_w = token_weights[:, 1:]
-    max_private = private_w.max(dim=1).values
-    other_private_max = private_w[:, 1:].max(dim=1).values
+    if num_tokens == 6:
+        shared_group = token_weights[:, :3]
+        private_w = token_weights[:, 3:]
+        shared_w = shared_group.sum(dim=1)
+        private_total = private_w.sum(dim=1)
+        text_w = token_weights[:, 0] + token_weights[:, 3]
+        vision_w = token_weights[:, 1] + token_weights[:, 4]
+        audio_w = token_weights[:, 2] + token_weights[:, 5]
+        other_modality_max = torch.stack([vision_w, audio_w], dim=1).max(dim=1).values
+        max_private = private_w.max(dim=1).values
 
-    shared_floor_penalty = F.relu(shared_target_weight - shared_w).mean()
-    shared_margin_penalty = F.relu(max_private + shared_margin - shared_w).mean()
-    private_floor_penalty = F.relu(private_min_weight - private_w).mean()
-    text_soft_rank_penalty = F.relu(other_private_max + 0.01 - text_w).mean()
+        shared_floor_penalty = F.relu(0.40 - shared_w).mean()
+        shared_margin_penalty = F.relu((private_total - shared_w).abs() - 0.20).mean()
+        private_floor_penalty = F.relu(private_min_weight - private_w).mean()
+        text_soft_rank_penalty = F.relu(other_modality_max + 0.01 - text_w).mean()
+        dominance_margin = text_w - other_modality_max
+    else:
+        shared_w = token_weights[:, 0]
+        text_w = token_weights[:, 1]
+        private_w = token_weights[:, 1:]
+        max_private = private_w.max(dim=1).values
+        other_private_max = private_w[:, 1:].max(dim=1).values
+
+        shared_floor_penalty = F.relu(shared_target_weight - shared_w).mean()
+        shared_margin_penalty = F.relu(max_private + shared_margin - shared_w).mean()
+        private_floor_penalty = F.relu(private_min_weight - private_w).mean()
+        text_soft_rank_penalty = F.relu(other_private_max + 0.01 - text_w).mean()
+        dominance_margin = shared_w - max_private
     peak_penalty = F.relu(token_weights.max(dim=1).values - max_weight).mean()
 
     loss = (
@@ -361,7 +386,7 @@ def token_regularization_loss(
         "token_peak_penalty": float(peak_penalty.item()),
         "token_shared_mean": float(shared_w.mean().item()),
         "token_private_max_mean": float(max_private.mean().item()),
-        "token_dominance_margin": float((shared_w - max_private).mean().item()),
+        "token_dominance_margin": float(dominance_margin.mean().item()),
     }
     return loss, stats
 
@@ -507,6 +532,36 @@ def total_loss(
     shared_mixer_aux = aux["shared_mixer_aux"]
     modality_attn = _dp_reduce_matrix_lastdim(shared_mixer_aux["modality_attn"])
     token_weights = _dp_reduce_matrix_lastdim(token_weights)
+    if token_weights.size(1) >= 6:
+        token_weight_t_shared = token_weights[:, 0].mean()
+        token_weight_v_shared = token_weights[:, 1].mean()
+        token_weight_a_shared = token_weights[:, 2].mean()
+        token_weight_t_private = token_weights[:, 3].mean()
+        token_weight_v_private = token_weights[:, 4].mean()
+        token_weight_a_private = token_weights[:, 5].mean()
+        token_weight_shared = token_weights[:, :3].sum(dim=1).mean()
+        token_weight_text = (token_weights[:, 0] + token_weights[:, 3]).mean()
+        token_weight_vision = (token_weights[:, 1] + token_weights[:, 4]).mean()
+        token_weight_audio = (token_weights[:, 2] + token_weights[:, 5]).mean()
+        shared_idx = [0, 1, 2]
+        text_idx = [0, 3]
+        vision_idx = [1, 4]
+        audio_idx = [2, 5]
+    else:
+        token_weight_t_shared = token_weights[:, 0].mean()
+        token_weight_v_shared = token_weights[:, 0].new_zeros(())
+        token_weight_a_shared = token_weights[:, 0].new_zeros(())
+        token_weight_t_private = token_weights[:, 1].mean()
+        token_weight_v_private = token_weights[:, 2].mean()
+        token_weight_a_private = token_weights[:, 3].mean()
+        token_weight_shared = token_weights[:, 0].mean()
+        token_weight_text = token_weights[:, 1].mean()
+        token_weight_vision = token_weights[:, 2].mean()
+        token_weight_audio = token_weights[:, 3].mean()
+        shared_idx = [0]
+        text_idx = [1]
+        vision_idx = [2]
+        audio_idx = [3]
     gate_t_probs = _as_float_tensor(aux["tmoe_t_aux"]["gate_probs"])
     gate_v_probs = _as_float_tensor(aux["tmoe_v_aux"]["gate_probs"])
     gate_a_probs = _as_float_tensor(aux["tmoe_a_aux"]["gate_probs"])
@@ -556,15 +611,21 @@ def total_loss(
         "modality_attn_t": _dp_reduce_scalar(modality_attn[:, 0].mean()),
         "modality_attn_v": _dp_reduce_scalar(modality_attn[:, 1].mean()),
         "modality_attn_a": _dp_reduce_scalar(modality_attn[:, 2].mean()),
-        "token_weight_shared": _dp_reduce_scalar(token_weights[:, 0].mean()),
-        "token_weight_text": _dp_reduce_scalar(token_weights[:, 1].mean()),
-        "token_weight_vision": _dp_reduce_scalar(token_weights[:, 2].mean()),
-        "token_weight_audio": _dp_reduce_scalar(token_weights[:, 3].mean()),
+        "token_weight_t_shared": _dp_reduce_scalar(token_weight_t_shared),
+        "token_weight_v_shared": _dp_reduce_scalar(token_weight_v_shared),
+        "token_weight_a_shared": _dp_reduce_scalar(token_weight_a_shared),
+        "token_weight_t_private": _dp_reduce_scalar(token_weight_t_private),
+        "token_weight_v_private": _dp_reduce_scalar(token_weight_v_private),
+        "token_weight_a_private": _dp_reduce_scalar(token_weight_a_private),
+        "token_weight_shared": _dp_reduce_scalar(token_weight_shared),
+        "token_weight_text": _dp_reduce_scalar(token_weight_text),
+        "token_weight_vision": _dp_reduce_scalar(token_weight_vision),
+        "token_weight_audio": _dp_reduce_scalar(token_weight_audio),
         "token_dominance_margin": token_stats["token_dominance_margin"],
-        "attn_shared_to_shared": _dp_reduce_scalar(fusion_attn[:, 0, 0].mean()),
-        "attn_shared_to_text": _dp_reduce_scalar(fusion_attn[:, 0, 1].mean()),
-        "attn_shared_to_vision": _dp_reduce_scalar(fusion_attn[:, 0, 2].mean()),
-        "attn_shared_to_audio": _dp_reduce_scalar(fusion_attn[:, 0, 3].mean()),
+        "attn_shared_to_shared": _dp_reduce_scalar(fusion_attn[:, shared_idx][:, :, shared_idx].mean()),
+        "attn_shared_to_text": _dp_reduce_scalar(fusion_attn[:, shared_idx][:, :, text_idx].mean()),
+        "attn_shared_to_vision": _dp_reduce_scalar(fusion_attn[:, shared_idx][:, :, vision_idx].mean()),
+        "attn_shared_to_audio": _dp_reduce_scalar(fusion_attn[:, shared_idx][:, :, audio_idx].mean()),
         "gate_t_mean": _dp_reduce_scalar(gate_t_probs.max(dim=-1).values.mean()),
         "gate_v_mean": _dp_reduce_scalar(gate_v_probs.max(dim=-1).values.mean()),
         "gate_a_mean": _dp_reduce_scalar(gate_a_probs.max(dim=-1).values.mean()),
@@ -635,6 +696,12 @@ def evaluate(
         "modality_attn_t": 0.0,
         "modality_attn_v": 0.0,
         "modality_attn_a": 0.0,
+        "token_weight_t_shared": 0.0,
+        "token_weight_v_shared": 0.0,
+        "token_weight_a_shared": 0.0,
+        "token_weight_t_private": 0.0,
+        "token_weight_v_private": 0.0,
+        "token_weight_a_private": 0.0,
         "token_weight_shared": 0.0,
         "token_weight_text": 0.0,
         "token_weight_vision": 0.0,
@@ -715,6 +782,8 @@ def evaluate(
             "multi_layer_select_std", "multi_layer_cross_intra_gap", "multi_layer_select_spread",
             "late_std_preserve_penalty", "late_spread_preserve_penalty",
             "modality_attn_t", "modality_attn_v", "modality_attn_a",
+            "token_weight_t_shared", "token_weight_v_shared", "token_weight_a_shared",
+            "token_weight_t_private", "token_weight_v_private", "token_weight_a_private",
             "token_weight_shared", "token_weight_text", "token_weight_vision", "token_weight_audio", "token_dominance_margin",
             "attn_shared_to_shared", "attn_shared_to_text", "attn_shared_to_vision", "attn_shared_to_audio",
             "gate_t_mean", "gate_v_mean", "gate_a_mean",
