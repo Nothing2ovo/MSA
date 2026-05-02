@@ -30,6 +30,10 @@ Current experimental variant:
 5. The 6-token prior is rebalanced to reduce text-private dominance, and the
    shared mixer regularizer now constrains refined shared-token alignment,
    anti-collapse, modality-attention balance, and token-norm balance.
+6. Residual passthroughs are removed from the shared Mamba path, TMoE experts,
+   token fusion block, and shared feature builder. These modules now return
+   their transformed outputs directly instead of original features plus a
+   correction term.
 
 Core model path:
 Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token fusion -> sentiment prediction.

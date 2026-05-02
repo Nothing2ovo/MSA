@@ -29,7 +29,7 @@ class AttentionPool(nn.Module):
 
 
 class GlobalLocalContextExtractor(nn.Module):
-    """ISM-style global-local context extraction."""
+    """ISM-style global-local context extraction without residual passthrough."""
 
     def __init__(self, dim: int, dropout: float = 0.1):
         super().__init__()
@@ -50,11 +50,11 @@ class GlobalLocalContextExtractor(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         global_ctx = self.global_proj(x)
         local_ctx = self.local_conv(x.transpose(1, 2)).transpose(1, 2)
-        return x + self.dropout(self.norm(global_ctx + local_ctx))
+        return self.dropout(self.norm(global_ctx + local_ctx))
 
 
 class OfficialMambaBlock(nn.Module):
-    """Pre-norm residual wrapper around the official mamba_ssm.Mamba operator."""
+    """Pre-norm wrapper around the official mamba_ssm.Mamba operator."""
 
     def __init__(
         self,
@@ -89,7 +89,7 @@ class OfficialMambaBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         z = self.norm(x)
         y = self.mamba(z)
-        out = self.out_norm(x + self.dropout(y))
+        out = self.out_norm(self.dropout(y))
 
         # Official Mamba does not expose its internal B/C/Delta gates. This probe
         # is only used as a stable diagnostic for selectivity/anti-collapse logs.
@@ -136,7 +136,7 @@ class BiDirectionalMamba(nn.Module):
         y_b_rev, stats_b = self.backward_mamba(torch.flip(x, dims=[1]))
         y_b = torch.flip(y_b_rev, dims=[1])
         y = self.merge(torch.cat([y_f, y_b], dim=-1))
-        out = self.out_norm(x + y)
+        out = self.out_norm(y)
         stats = {
             "select_mean": 0.5 * (stats_f["select_mean"] + stats_b["select_mean"]),
             "select_std": 0.5 * (stats_f["select_std"] + stats_b["select_std"]),
@@ -193,7 +193,7 @@ class SharedSelectiveStateMixerLayer(nn.Module):
         intra_in = self.intra_glce(intra_in)
         intra_out, intra_stats = self.intra_mamba(intra_in)
         intra_out = intra_out.view(batch_size, num_modalities, seq_len, hidden_dim)
-        out = self.layer_norm(x + self.dropout(intra_out))
+        out = self.layer_norm(self.dropout(intra_out))
 
         zero = intra_stats["select_mean"].new_zeros(())
         stats = {

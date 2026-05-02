@@ -375,7 +375,6 @@ def main() -> None:
         mamba_expand=2,
         dropout=dropout,
         shared_drop_rate=shared_drop_rate,
-        shared_residual_scale=0.20,
         use_shared_cross_attention=False,
         require_official_mamba=True,
     ).to(device)

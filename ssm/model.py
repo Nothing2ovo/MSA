@@ -75,20 +75,28 @@ class AttentionPool(nn.Module):
 class TransformerExpert(nn.Module):
     def __init__(self, input_dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
-        layer = nn.TransformerEncoderLayer(
-            d_model=input_dim,
-            nhead=num_heads,
-            dim_feedforward=input_dim * 4,
+        self.attn = nn.MultiheadAttention(
+            embed_dim=input_dim,
+            num_heads=num_heads,
             dropout=dropout,
-            activation="gelu",
             batch_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=1)
+        self.attn_norm = nn.LayerNorm(input_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, input_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim * 4, input_dim),
+            nn.Dropout(dropout),
+        )
+        self.ffn_norm = nn.LayerNorm(input_dim)
         self.pool = AttentionPool(input_dim, hidden_dim=max(64, input_dim), dropout=dropout)
         self.norm = nn.LayerNorm(input_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.encoder(x)
+        attn_out, _ = self.attn(x, x, x, need_weights=False)
+        z = self.attn_norm(attn_out)
+        z = self.ffn_norm(self.ffn(z))
         pooled, _ = self.pool(z)
         return self.norm(pooled)
 
@@ -293,9 +301,7 @@ class TokenLevelDynamicWeighting(nn.Module):
         token_weights = token_weights + 0.30 * under_floor
         token_weights = token_weights / token_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
-        guided_tokens = typed_tokens.clone()
-        guided_tokens[:, :3, :] = guided_tokens[:, :3, :] + 0.5 * self.shared_to_private_scale * private_mean.unsqueeze(1)
-        guided_tokens[:, 3:, :] = guided_tokens[:, 3:, :] + self.shared_to_private_scale * shared_anchor.unsqueeze(1)
+        guided_tokens = typed_tokens
 
         token_scale = 1.0 + self.gate_scale * (token_weights - prior_dist)
         token_scale = token_scale.clamp(min=0.90, max=1.25)
@@ -353,9 +359,9 @@ class TokenTransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         attn_out, attn_weights = self.attn(x, x, x, need_weights=True, average_attn_weights=False)
-        x = self.norm1(x + attn_out)
+        x = self.norm1(attn_out)
         ffn_out = self.ffn(x)
-        x = self.norm2(x + ffn_out)
+        x = self.norm2(ffn_out)
         return x, attn_weights
 
 
@@ -405,13 +411,11 @@ class DHMModel(nn.Module):
         mamba_expand: int = 2,
         dropout: float = 0.5,
         shared_drop_rate: float = 0.15,
-        shared_residual_scale: float = 0.20,
         use_shared_cross_attention: bool = True,
         require_official_mamba: bool = True,
     ):
         super().__init__()
         self.shared_drop_rate = float(shared_drop_rate)
-        self.shared_residual_scale = float(shared_residual_scale)
 
         self.text_conv = TemporalConvEncoder(text_dim, conv_hidden, kernel_size=3, dropout=dropout)
         self.vision_conv = TemporalConvEncoder(vision_dim, conv_hidden, kernel_size=3, dropout=dropout)
@@ -420,10 +424,6 @@ class DHMModel(nn.Module):
         self.shared_core_t = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
         self.shared_core_v = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
         self.shared_core_a = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
-
-        self.shared_res_t = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
-        self.shared_res_v = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
-        self.shared_res_a = SequenceMLPEncoder(conv_hidden, shared_dim, dropout=dropout)
 
         self.private_t = SequenceMLPEncoder(conv_hidden, private_dim, dropout=dropout)
         self.private_v = SequenceMLPEncoder(conv_hidden, private_dim, dropout=dropout)
@@ -468,20 +468,19 @@ class DHMModel(nn.Module):
         self.fusion_norm = nn.LayerNorm(fusion_dim)
         self.regressor = RegressionHead(fusion_dim, hidden_dim=fusion_dim, dropout=dropout)
 
-    def _build_shared(self, c: torch.Tensor, core_encoder: nn.Module, residual_encoder: nn.Module) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _build_shared(self, c: torch.Tensor, core_encoder: nn.Module) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         core = core_encoder(c)
-        residual = residual_encoder(c)
-        shared = core + self.shared_residual_scale * residual
-        return shared, core, residual
+        residual = torch.zeros_like(core)
+        return core, core, residual
 
     def forward(self, text: torch.Tensor, vision: torch.Tensor, audio: torch.Tensor):
         c_t = self.text_conv(text)
         c_v = self.vision_conv(vision)
         c_a = self.audio_conv(audio)
 
-        e_irr_t, e_irr_core_t, e_irr_res_t = self._build_shared(c_t, self.shared_core_t, self.shared_res_t)
-        e_irr_v, e_irr_core_v, e_irr_res_v = self._build_shared(c_v, self.shared_core_v, self.shared_res_v)
-        e_irr_a, e_irr_core_a, e_irr_res_a = self._build_shared(c_a, self.shared_core_a, self.shared_res_a)
+        e_irr_t, e_irr_core_t, e_irr_res_t = self._build_shared(c_t, self.shared_core_t)
+        e_irr_v, e_irr_core_v, e_irr_res_v = self._build_shared(c_v, self.shared_core_v)
+        e_irr_a, e_irr_core_a, e_irr_res_a = self._build_shared(c_a, self.shared_core_a)
 
         e_spe_t = self.private_t(c_t)
         e_spe_v = self.private_v(c_v)
