@@ -326,7 +326,7 @@ def main() -> None:
     num_experts = 3
     top_k = 1
     num_heads = 4
-    mixer_layers = 3
+    mixer_layers = 4
     mamba_state_dim = 16
     shared_drop_rate = 0.15
 
