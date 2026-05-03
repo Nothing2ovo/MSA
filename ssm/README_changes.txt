@@ -34,6 +34,8 @@ Current experimental variant:
    token fusion block, and shared feature builder. These modules now return
    their transformed outputs directly instead of original features plus a
    correction term.
+7. The intra-modal SharedSelectiveStateMixer depth is increased from 2 to 3
+   stacked Mamba mixer layers for the next MOSEI experiment.
 
 Core model path:
 Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token fusion -> sentiment prediction.

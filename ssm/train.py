@@ -326,7 +326,7 @@ def main() -> None:
     num_experts = 3
     top_k = 1
     num_heads = 4
-    mixer_layers = 2
+    mixer_layers = 3
     mamba_state_dim = 16
     shared_drop_rate = 0.15
 
@@ -336,7 +336,7 @@ def main() -> None:
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
         f"token_reg={token_reg_weight:.3f} mixer_reg={shared_mixer_reg_weight:.3f} shared_aux={shared_aux_weight:.3f} "
         f"orth={orth_weight:.3f} shared_align={shared_align_weight:.3f} private_div={private_div_weight:.3f} "
-        f"shared_drop={shared_drop_rate:.2f} mamba_state={mamba_state_dim} | ckpt=MAE>Corr"
+        f"shared_drop={shared_drop_rate:.2f} mixer_layers={mixer_layers} mamba_state={mamba_state_dim} | ckpt=MAE>Corr"
     )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")

@@ -405,7 +405,7 @@ class DHMModel(nn.Module):
         num_experts: int = 3,
         top_k: int = 1,
         num_heads: int = 4,
-        mixer_layers: int = 2,
+        mixer_layers: int = 3,
         mamba_state_dim: int = 16,
         mamba_conv_kernel: int = 3,
         mamba_expand: int = 2,

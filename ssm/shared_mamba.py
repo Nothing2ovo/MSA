@@ -220,7 +220,7 @@ class SharedSelectiveStateMixer(nn.Module):
         self,
         node_dim: int,
         hidden_dim: int,
-        num_layers: int = 2,
+        num_layers: int = 3,
         num_heads: int = 4,
         state_dim: int = 16,
         conv_kernel: int = 3,
