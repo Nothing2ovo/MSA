@@ -34,7 +34,7 @@ Current experimental variant:
    token fusion block, and shared feature builder. These modules now return
    their transformed outputs directly instead of original features plus a
    correction term.
-7. The intra-modal SharedSelectiveStateMixer depth is increased to 6
+7. The intra-modal SharedSelectiveStateMixer depth is increased to 10
    stacked Mamba mixer layers for the next MOSEI experiment.
 8. The default training horizon is extended to 100 epochs with patience 15.
    Kaggle runs can override these through EPOCHS and PATIENCE environment
