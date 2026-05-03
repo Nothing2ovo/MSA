@@ -295,10 +295,10 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
 
     batch_size = 32
-    num_epochs = int(os.environ.get("EPOCHS", "60"))
+    num_epochs = int(os.environ.get("EPOCHS", "100"))
     learning_rate = 6e-5
     weight_decay = 1e-4
-    patience = int(os.environ.get("PATIENCE", "10"))
+    patience = int(os.environ.get("PATIENCE", "15"))
     grad_clip = 1.0
 
     sim_weight = 0.02
@@ -326,7 +326,7 @@ def main() -> None:
     num_experts = 3
     top_k = 1
     num_heads = 4
-    mixer_layers = 4
+    mixer_layers = 6
     mamba_state_dim = 16
     shared_drop_rate = 0.15
 
