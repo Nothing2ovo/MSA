@@ -295,10 +295,10 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
 
     batch_size = 32
-    num_epochs = 30
+    num_epochs = int(os.environ.get("EPOCHS", "60"))
     learning_rate = 6e-5
     weight_decay = 1e-4
-    patience = 8
+    patience = int(os.environ.get("PATIENCE", "10"))
     grad_clip = 1.0
 
     sim_weight = 0.02
@@ -336,7 +336,8 @@ def main() -> None:
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
         f"token_reg={token_reg_weight:.3f} mixer_reg={shared_mixer_reg_weight:.3f} shared_aux={shared_aux_weight:.3f} "
         f"orth={orth_weight:.3f} shared_align={shared_align_weight:.3f} private_div={private_div_weight:.3f} "
-        f"shared_drop={shared_drop_rate:.2f} mixer_layers={mixer_layers} mamba_state={mamba_state_dim} | ckpt=MAE>Corr"
+        f"shared_drop={shared_drop_rate:.2f} mixer_layers={mixer_layers} mamba_state={mamba_state_dim} "
+        f"epochs={num_epochs} patience={patience} | ckpt=MAE>Corr"
     )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")

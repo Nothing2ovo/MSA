@@ -36,6 +36,9 @@ Current experimental variant:
    correction term.
 7. The intra-modal SharedSelectiveStateMixer depth is increased from 3 to 4
    stacked Mamba mixer layers for the next MOSEI experiment.
+8. The default training horizon is extended to 60 epochs with patience 10.
+   Kaggle runs can override these through EPOCHS and PATIENCE environment
+   variables to check whether deeper Mamba stacks keep improving after epoch 30.
 
 Core model path:
 Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token fusion -> sentiment prediction.
