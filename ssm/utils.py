@@ -7,13 +7,15 @@ import torch.nn.functional as F
 DEFAULT_MOE_BALANCE_WEIGHT = 1e-2
 DEFAULT_TOKEN_REG_WEIGHT = 2e-2
 DEFAULT_SHARED_MIXER_REG_WEIGHT = 5.5e-2
-DEFAULT_TOKEN_TARGET_ENTROPY = 0.70
+DEFAULT_TOKEN_TARGET_ENTROPY = 0.90
 DEFAULT_PRIVATE_MIN_WEIGHT = 0.055
 DEFAULT_SHARED_TARGET_WEIGHT = 0.27
 DEFAULT_SHARED_DOMINANCE_MARGIN = 0.005
 DEFAULT_TOKEN_MAX_WEIGHT = 0.68
-DEFAULT_TOKEN_MIN_SPREAD = 0.055
-DEFAULT_TOKEN_MIN_TOP_GAP = 0.030
+DEFAULT_TOKEN_MIN_SPREAD = 0.030
+DEFAULT_TOKEN_MIN_TOP_GAP = 0.010
+DEFAULT_TEXT_MIN_TOTAL_WEIGHT = 0.28
+DEFAULT_TEXT_MAX_LAG = 0.04
 DEFAULT_SELECT_TARGET_STD = 0.034
 DEFAULT_SELECT_MIN_GAP = 0.013
 DEFAULT_CROSS_SELECT_TARGET_STD = 0.018
@@ -349,6 +351,8 @@ def token_regularization_loss(
     max_weight: float = DEFAULT_TOKEN_MAX_WEIGHT,
     min_spread: float = DEFAULT_TOKEN_MIN_SPREAD,
     min_top_gap: float = DEFAULT_TOKEN_MIN_TOP_GAP,
+    text_min_weight: float = DEFAULT_TEXT_MIN_TOTAL_WEIGHT,
+    text_max_lag: float = DEFAULT_TEXT_MAX_LAG,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     eps = 1e-8
     num_tokens = token_weights.size(1)
@@ -385,6 +389,8 @@ def token_regularization_loss(
         private_floor_penalty = zero
         text_soft_rank_penalty = zero
         dominance_margin = text_w - other_modality_max
+        text_floor_penalty = F.relu(text_min_weight - text_w).mean()
+        text_lag_penalty = F.relu(other_modality_max - text_w - text_max_lag).mean()
     else:
         shared_w = token_weights[:, 0]
         text_w = token_weights[:, 1]
@@ -396,12 +402,16 @@ def token_regularization_loss(
         private_floor_penalty = zero
         text_soft_rank_penalty = zero
         dominance_margin = shared_w - max_private
+        text_floor_penalty = zero
+        text_lag_penalty = zero
     peak_penalty = F.relu(token_weights.max(dim=1).values - max_weight).mean()
 
     loss = (
         entropy_penalty
-        + 0.70 * spread_penalty
-        + 0.45 * top_gap_penalty
+        + 0.20 * spread_penalty
+        + 0.10 * top_gap_penalty
+        + 0.20 * text_floor_penalty
+        + 0.15 * text_lag_penalty
         + 0.75 * peak_penalty
     )
     stats = {
@@ -415,6 +425,9 @@ def token_regularization_loss(
         "token_shared_mean": float(shared_w.mean().item()),
         "token_private_max_mean": float(max_private.mean().item()),
         "token_dominance_margin": float(dominance_margin.mean().item()),
+        "token_text_mean": float(text_w.mean().item()),
+        "token_text_floor_penalty": float(text_floor_penalty.item()),
+        "token_text_lag_penalty": float(text_lag_penalty.item()),
         "token_spread": float(sample_spread.mean().item()),
         "token_top_gap": float(top_gap.mean().item()),
         "token_top_gap_penalty": float(top_gap_penalty.item()),
@@ -721,6 +734,9 @@ def evaluate(
         "token_spread": 0.0,
         "token_top_gap": 0.0,
         "token_top_gap_penalty": 0.0,
+        "token_text_mean": 0.0,
+        "token_text_floor_penalty": 0.0,
+        "token_text_lag_penalty": 0.0,
         "cross_select_mean": 0.0,
         "intra_select_mean": 0.0,
         "cross_select_std": 0.0,
@@ -824,6 +840,9 @@ def evaluate(
         totals["token_spread"] += stats["token_spread"] * batch_size
         totals["token_top_gap"] += stats["token_top_gap"] * batch_size
         totals["token_top_gap_penalty"] += stats["token_top_gap_penalty"] * batch_size
+        totals["token_text_mean"] += stats["token_text_mean"] * batch_size
+        totals["token_text_floor_penalty"] += stats["token_text_floor_penalty"] * batch_size
+        totals["token_text_lag_penalty"] += stats["token_text_lag_penalty"] * batch_size
 
         for key in [
             "cross_select_mean", "intra_select_mean",
@@ -938,6 +957,9 @@ def train_one_epoch(
         "token_spread": 0.0,
         "token_top_gap": 0.0,
         "token_top_gap_penalty": 0.0,
+        "token_text_mean": 0.0,
+        "token_text_floor_penalty": 0.0,
+        "token_text_lag_penalty": 0.0,
     }
 
     amp_device = "cuda" if device.type == "cuda" else "cpu"
@@ -1010,6 +1032,9 @@ def train_one_epoch(
         totals["token_spread"] += stats["token_spread"] * batch_size
         totals["token_top_gap"] += stats["token_top_gap"] * batch_size
         totals["token_top_gap_penalty"] += stats["token_top_gap_penalty"] * batch_size
+        totals["token_text_mean"] += stats["token_text_mean"] * batch_size
+        totals["token_text_floor_penalty"] += stats["token_text_floor_penalty"] * batch_size
+        totals["token_text_lag_penalty"] += stats["token_text_lag_penalty"] * batch_size
 
     return {
         "train_total_loss": totals["loss"] / max(1, total_samples),
@@ -1037,4 +1062,7 @@ def train_one_epoch(
         "train_token_spread": totals["token_spread"] / max(1, total_samples),
         "train_token_top_gap": totals["token_top_gap"] / max(1, total_samples),
         "train_token_top_gap_penalty": totals["token_top_gap_penalty"] / max(1, total_samples),
+        "train_token_text_mean": totals["token_text_mean"] / max(1, total_samples),
+        "train_token_text_floor_penalty": totals["token_text_floor_penalty"] / max(1, total_samples),
+        "train_token_text_lag_penalty": totals["token_text_lag_penalty"] / max(1, total_samples),
     }

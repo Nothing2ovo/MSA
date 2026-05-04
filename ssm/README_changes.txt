@@ -35,8 +35,9 @@ Current experimental variant:
    token fusion block, and shared feature builder. These modules now return
    their transformed outputs directly instead of original features plus a
    correction term.
-7. The intra-modal SharedSelectiveStateMixer depth is increased to 10
-   stacked Mamba mixer layers for the next MOSEI experiment.
+7. The intra-modal SharedSelectiveStateMixer depth is set to 6 stacked
+   Mamba mixer layers. This keeps the deeper shared path that improved the
+   regression metrics while avoiding the stronger collapse observed at 10 layers.
 8. The default training horizon is extended to 100 epochs with patience 15.
    Kaggle runs can override these through EPOCHS and PATIENCE environment
    variables to check whether deeper Mamba stacks need a longer convergence window.
@@ -45,8 +46,8 @@ Current experimental variant:
    floors are removed so the final weights are learned from interacted tokens.
 10. Post-interaction dynamic weighting is strengthened with type-aware,
    token-specific, and contrastive token scorers. Token regularization now
-   penalizes over-uniform weights through entropy, per-sample spread, and
-   top-token gap terms instead of pulling weights toward a fixed prior.
+   uses a relaxed anti-uniform objective plus weak text-total guardrails, so
+   weights can move after interaction without suppressing the text branch.
 
 Core model path:
 Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token interaction -> type-aware dynamic weighting -> sentiment prediction.

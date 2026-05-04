@@ -210,6 +210,7 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
         f"  attn s->s/t/v/a     : {analysis['attn_shared_to_shared']:.4f} / {analysis['attn_shared_to_text']:.4f} / {analysis['attn_shared_to_vision']:.4f} / {analysis['attn_shared_to_audio']:.4f}",
         f"  gate t/v/a          : {analysis['gate_t_mean']:.4f} / {analysis['gate_v_mean']:.4f} / {analysis['gate_a_mean']:.4f}",
         f"  token spread/topgap/peak: {analysis['token_spread']:.4f} / {analysis['token_top_gap']:.4f} / {analysis['token_peak_penalty']:.4f}",
+        f"  token text/lag guards: {analysis['token_text_mean']:.4f} / {analysis['token_text_lag_penalty']:.4f}",
         f"  shared view gap     : {analysis['shared_view_gap']:.4f}",
         f"  fused repr norm     : {analysis['fused_repr_norm']:.4f}",
         "",
@@ -261,6 +262,7 @@ def print_epoch_summary(
         f"  6-token detail  = entropy {valid_metrics['token_entropy']:.4f} | spread {valid_metrics['analysis']['token_spread']:.4f} | "
         f"topgap {valid_metrics['analysis']['token_top_gap']:.4f} | batch-var {valid_metrics['token_balance']:.4f} | "
         f"maxw {valid_metrics['token_max_weight']:.4f} | dom {valid_metrics['analysis']['token_dominance_margin']:.4f} | "
+        f"text {valid_metrics['analysis']['token_text_mean']:.4f} | text-lag {valid_metrics['analysis']['token_text_lag_penalty']:.4f} | "
         f"spread-pen {valid_metrics['analysis']['token_spread_penalty']:.4f} | peak {valid_metrics['analysis']['token_peak_penalty']:.4f}"
     )
     print(
@@ -327,7 +329,7 @@ def main() -> None:
     num_experts = 3
     top_k = 1
     num_heads = 4
-    mixer_layers = 10
+    mixer_layers = 6
     mamba_state_dim = 16
     shared_drop_rate = 0.15
 
