@@ -7,11 +7,13 @@ import torch.nn.functional as F
 DEFAULT_MOE_BALANCE_WEIGHT = 1e-2
 DEFAULT_TOKEN_REG_WEIGHT = 2e-2
 DEFAULT_SHARED_MIXER_REG_WEIGHT = 5.5e-2
-DEFAULT_TOKEN_TARGET_ENTROPY = 0.78
+DEFAULT_TOKEN_TARGET_ENTROPY = 0.70
 DEFAULT_PRIVATE_MIN_WEIGHT = 0.055
 DEFAULT_SHARED_TARGET_WEIGHT = 0.27
 DEFAULT_SHARED_DOMINANCE_MARGIN = 0.005
 DEFAULT_TOKEN_MAX_WEIGHT = 0.68
+DEFAULT_TOKEN_MIN_SPREAD = 0.055
+DEFAULT_TOKEN_MIN_TOP_GAP = 0.030
 DEFAULT_SELECT_TARGET_STD = 0.034
 DEFAULT_SELECT_MIN_GAP = 0.013
 DEFAULT_CROSS_SELECT_TARGET_STD = 0.018
@@ -345,16 +347,27 @@ def token_regularization_loss(
     shared_target_weight: float = DEFAULT_SHARED_TARGET_WEIGHT,
     shared_margin: float = DEFAULT_SHARED_DOMINANCE_MARGIN,
     max_weight: float = DEFAULT_TOKEN_MAX_WEIGHT,
+    min_spread: float = DEFAULT_TOKEN_MIN_SPREAD,
+    min_top_gap: float = DEFAULT_TOKEN_MIN_TOP_GAP,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     eps = 1e-8
     num_tokens = token_weights.size(1)
     entropy = -(token_weights * torch.log(token_weights.clamp_min(eps))).sum(dim=1)
     entropy = entropy / math.log(num_tokens)
-    entropy_penalty = (entropy - target_entropy).pow(2).mean()
+    entropy_penalty = F.relu(entropy - target_entropy).pow(2).mean()
 
     mean_w = token_weights.mean(dim=0)
     batch_balance = mean_w.var(unbiased=False)
     zero = token_weights.new_zeros(())
+    sample_spread = token_weights.std(dim=1, unbiased=False)
+    spread_penalty = F.relu(min_spread - sample_spread).mean()
+    top2 = torch.topk(token_weights, k=min(2, num_tokens), dim=1).values
+    if top2.size(1) == 2:
+        top_gap = top2[:, 0] - top2[:, 1]
+        top_gap_penalty = F.relu(min_top_gap - top_gap).mean()
+    else:
+        top_gap = token_weights.new_zeros(token_weights.size(0))
+        top_gap_penalty = zero
 
     if num_tokens == 6:
         shared_group = token_weights[:, :3]
@@ -387,7 +400,8 @@ def token_regularization_loss(
 
     loss = (
         entropy_penalty
-        + 0.10 * batch_balance
+        + 0.70 * spread_penalty
+        + 0.45 * top_gap_penalty
         + 0.75 * peak_penalty
     )
     stats = {
@@ -395,11 +409,15 @@ def token_regularization_loss(
         "token_entropy": float(entropy.mean().item()),
         "token_balance": float(batch_balance.item()),
         "token_max_weight": float(token_weights.max(dim=1).values.mean().item()),
-        "token_floor_penalty": float(private_floor_penalty.item()),
+        "token_floor_penalty": float(spread_penalty.item()),
+        "token_spread_penalty": float(spread_penalty.item()),
         "token_peak_penalty": float(peak_penalty.item()),
         "token_shared_mean": float(shared_w.mean().item()),
         "token_private_max_mean": float(max_private.mean().item()),
         "token_dominance_margin": float(dominance_margin.mean().item()),
+        "token_spread": float(sample_spread.mean().item()),
+        "token_top_gap": float(top_gap.mean().item()),
+        "token_top_gap_penalty": float(top_gap_penalty.item()),
     }
     return loss, stats
 
@@ -698,7 +716,11 @@ def evaluate(
         "token_balance": 0.0,
         "token_max_weight": 0.0,
         "token_floor_penalty": 0.0,
+        "token_spread_penalty": 0.0,
         "token_peak_penalty": 0.0,
+        "token_spread": 0.0,
+        "token_top_gap": 0.0,
+        "token_top_gap_penalty": 0.0,
         "cross_select_mean": 0.0,
         "intra_select_mean": 0.0,
         "cross_select_std": 0.0,
@@ -797,7 +819,11 @@ def evaluate(
         totals["token_balance"] += stats["token_balance"] * batch_size
         totals["token_max_weight"] += stats["token_max_weight"] * batch_size
         totals["token_floor_penalty"] += stats["token_floor_penalty"] * batch_size
+        totals["token_spread_penalty"] += stats["token_spread_penalty"] * batch_size
         totals["token_peak_penalty"] += stats["token_peak_penalty"] * batch_size
+        totals["token_spread"] += stats["token_spread"] * batch_size
+        totals["token_top_gap"] += stats["token_top_gap"] * batch_size
+        totals["token_top_gap_penalty"] += stats["token_top_gap_penalty"] * batch_size
 
         for key in [
             "cross_select_mean", "intra_select_mean",
@@ -907,7 +933,11 @@ def train_one_epoch(
         "token_balance": 0.0,
         "token_max_weight": 0.0,
         "token_floor_penalty": 0.0,
+        "token_spread_penalty": 0.0,
         "token_peak_penalty": 0.0,
+        "token_spread": 0.0,
+        "token_top_gap": 0.0,
+        "token_top_gap_penalty": 0.0,
     }
 
     amp_device = "cuda" if device.type == "cuda" else "cpu"
@@ -975,7 +1005,11 @@ def train_one_epoch(
         totals["token_balance"] += stats["token_balance"] * batch_size
         totals["token_max_weight"] += stats["token_max_weight"] * batch_size
         totals["token_floor_penalty"] += stats["token_floor_penalty"] * batch_size
+        totals["token_spread_penalty"] += stats["token_spread_penalty"] * batch_size
         totals["token_peak_penalty"] += stats["token_peak_penalty"] * batch_size
+        totals["token_spread"] += stats["token_spread"] * batch_size
+        totals["token_top_gap"] += stats["token_top_gap"] * batch_size
+        totals["token_top_gap_penalty"] += stats["token_top_gap_penalty"] * batch_size
 
     return {
         "train_total_loss": totals["loss"] / max(1, total_samples),
@@ -998,5 +1032,9 @@ def train_one_epoch(
         "train_token_balance": totals["token_balance"] / max(1, total_samples),
         "train_token_max_weight": totals["token_max_weight"] / max(1, total_samples),
         "train_token_floor_penalty": totals["token_floor_penalty"] / max(1, total_samples),
+        "train_token_spread_penalty": totals["token_spread_penalty"] / max(1, total_samples),
         "train_token_peak_penalty": totals["token_peak_penalty"] / max(1, total_samples),
+        "train_token_spread": totals["token_spread"] / max(1, total_samples),
+        "train_token_top_gap": totals["token_top_gap"] / max(1, total_samples),
+        "train_token_top_gap_penalty": totals["token_top_gap_penalty"] / max(1, total_samples),
     }

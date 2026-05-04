@@ -153,7 +153,7 @@ class TokenLevelDynamicWeighting(nn.Module):
         private_dim: int,
         token_dim: int = 128,
         dropout: float = 0.1,
-        temperature: float = 0.90,
+        temperature: float = 0.58,
         flatten_power: float = 1.0,
     ):
         super().__init__()
@@ -199,6 +199,21 @@ class TokenLevelDynamicWeighting(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(token_dim, 1),
         )
+        self.type_aware_score = nn.Sequential(
+            nn.Linear(token_dim * 3, token_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(token_dim, 1),
+        )
+        self.contrast_score = nn.Sequential(
+            nn.Linear(token_dim * 2, token_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(token_dim, 1),
+        )
+        self.token_query = nn.Parameter(torch.empty(1, self.num_tokens, token_dim))
+        nn.init.trunc_normal_(self.token_query, std=0.08)
+        self.score_norm = nn.LayerNorm(token_dim)
         self.shared_affinity_proj = nn.Linear(token_dim, token_dim)
         self.register_buffer("token_bias", torch.zeros(self.num_tokens, dtype=torch.float32))
         self.out_norm = nn.LayerNorm(token_dim)
@@ -237,30 +252,50 @@ class TokenLevelDynamicWeighting(nn.Module):
         interaction_tokens: torch.Tensor,
         aux: Dict[str, torch.Tensor] | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        shared_group = interaction_tokens[:, :3, :]
-        private_tokens = interaction_tokens[:, 3:, :]
+        typed_tokens = aux.get("typed_tokens", None) if aux is not None else None
+        if typed_tokens is None:
+            typed_tokens = interaction_tokens
+        score_tokens = self.score_norm(interaction_tokens + 0.35 * typed_tokens)
+
+        shared_group = score_tokens[:, :3, :]
+        private_tokens = score_tokens[:, 3:, :]
         shared_anchor = shared_group.mean(dim=1)
         private_mean = private_tokens.mean(dim=1)
         private_max = private_tokens.amax(dim=1)
         global_ctx = self.context_proj(torch.cat([shared_anchor, private_mean, private_max], dim=-1))
 
         query = F.normalize(self.query_proj(global_ctx), dim=-1)
-        keys = F.normalize(self.key_proj(interaction_tokens), dim=-1)
+        keys = F.normalize(self.key_proj(score_tokens), dim=-1)
         compat_score = torch.sum(keys * query.unsqueeze(1), dim=-1)
 
-        ctx_expand = global_ctx.unsqueeze(1).expand_as(interaction_tokens)
-        delta = interaction_tokens - ctx_expand
-        local_score = self.local_score(torch.cat([interaction_tokens, delta], dim=-1)).squeeze(-1)
+        ctx_expand = global_ctx.unsqueeze(1).expand_as(score_tokens)
+        delta = score_tokens - ctx_expand
+        local_score = self.local_score(torch.cat([score_tokens, delta], dim=-1)).squeeze(-1)
+
+        identity_delta = score_tokens - typed_tokens
+        type_score = self.type_aware_score(torch.cat([score_tokens, typed_tokens, identity_delta], dim=-1)).squeeze(-1)
+
+        token_center = score_tokens.mean(dim=1, keepdim=True)
+        contrast_delta = score_tokens - token_center
+        contrast_score = self.contrast_score(torch.cat([score_tokens, contrast_delta], dim=-1)).squeeze(-1)
 
         shared_ref = F.normalize(self.shared_affinity_proj(shared_anchor), dim=-1)
-        shared_affinity = torch.sum(F.normalize(interaction_tokens, dim=-1) * shared_ref.unsqueeze(1), dim=-1)
+        shared_affinity = torch.sum(F.normalize(score_tokens, dim=-1) * shared_ref.unsqueeze(1), dim=-1)
+        token_specific_score = torch.sum(
+            F.normalize(score_tokens, dim=-1) * F.normalize(self.token_query, dim=-1),
+            dim=-1,
+        )
 
         token_scores = (
-            compat_score
-            + 0.35 * local_score
+            0.45 * compat_score
+            + 0.55 * local_score
+            + 0.45 * type_score
+            + 0.35 * token_specific_score
+            + 0.25 * contrast_score
             + 0.12 * shared_affinity
             + self.token_bias.view(1, -1)
         )
+        token_scores = token_scores - token_scores.mean(dim=1, keepdim=True)
         token_weights = torch.softmax(token_scores / self.temperature, dim=1)
 
         if abs(self.flatten_power - 1.0) > 1e-6:
@@ -283,9 +318,15 @@ class TokenLevelDynamicWeighting(nn.Module):
         dominance_margin = text_total - torch.stack([vision_total, audio_total], dim=1).max(dim=1).values
         weight_aux = {
             "interaction_tokens": interaction_tokens,
+            "score_tokens": score_tokens,
             "guided_tokens": interaction_tokens,
             "weighted_tokens": weighted_tokens,
             "token_scores": token_scores,
+            "compat_score": compat_score,
+            "local_score": local_score,
+            "type_score": type_score,
+            "token_specific_score": token_specific_score,
+            "contrast_score": contrast_score,
             "token_weights": token_weights,
             "token_scale": token_scale,
             "prior_dist": prior_dist.expand(token_weights.size(0), -1),

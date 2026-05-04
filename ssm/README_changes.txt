@@ -43,6 +43,10 @@ Current experimental variant:
 9. The 6-token fusion path now performs token interaction before dynamic
    weighting. Fixed token priors, adaptive prior mixing, and hard shared/private
    floors are removed so the final weights are learned from interacted tokens.
+10. Post-interaction dynamic weighting is strengthened with type-aware,
+   token-specific, and contrastive token scorers. Token regularization now
+   penalizes over-uniform weights through entropy, per-sample spread, and
+   top-token gap terms instead of pulling weights toward a fixed prior.
 
 Core model path:
-Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token interaction -> dynamic weighting -> sentiment prediction.
+Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token interaction -> type-aware dynamic weighting -> sentiment prediction.
