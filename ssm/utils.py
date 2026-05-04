@@ -7,7 +7,7 @@ import torch.nn.functional as F
 DEFAULT_MOE_BALANCE_WEIGHT = 1e-2
 DEFAULT_TOKEN_REG_WEIGHT = 2e-2
 DEFAULT_SHARED_MIXER_REG_WEIGHT = 5.5e-2
-DEFAULT_TOKEN_TARGET_ENTROPY = 0.87
+DEFAULT_TOKEN_TARGET_ENTROPY = 0.78
 DEFAULT_PRIVATE_MIN_WEIGHT = 0.055
 DEFAULT_SHARED_TARGET_WEIGHT = 0.27
 DEFAULT_SHARED_DOMINANCE_MARGIN = 0.005
@@ -353,19 +353,8 @@ def token_regularization_loss(
     entropy_penalty = (entropy - target_entropy).pow(2).mean()
 
     mean_w = token_weights.mean(dim=0)
-    if num_tokens == 6:
-        target_prior = torch.tensor(
-            [0.20, 0.16, 0.14, 0.18, 0.16, 0.16],
-            device=token_weights.device,
-            dtype=token_weights.dtype,
-        )
-    else:
-        target_prior = torch.tensor(
-            [0.34, 0.26, 0.21, 0.19],
-            device=token_weights.device,
-            dtype=token_weights.dtype,
-        )
-    balance = F.mse_loss(mean_w, target_prior)
+    batch_balance = mean_w.var(unbiased=False)
+    zero = token_weights.new_zeros(())
 
     if num_tokens == 6:
         shared_group = token_weights[:, :3]
@@ -378,38 +367,33 @@ def token_regularization_loss(
         other_modality_max = torch.stack([vision_w, audio_w], dim=1).max(dim=1).values
         max_private = private_w.max(dim=1).values
 
-        shared_floor_penalty = F.relu(0.40 - shared_w).mean()
-        shared_margin_penalty = F.relu((private_total - shared_w).abs() - 0.20).mean()
-        private_floor_penalty = F.relu(private_min_weight - private_w).mean()
-        text_soft_rank_penalty = F.relu(other_modality_max + 0.01 - text_w).mean()
+        shared_floor_penalty = zero
+        shared_margin_penalty = zero
+        private_floor_penalty = zero
+        text_soft_rank_penalty = zero
         dominance_margin = text_w - other_modality_max
     else:
         shared_w = token_weights[:, 0]
         text_w = token_weights[:, 1]
         private_w = token_weights[:, 1:]
         max_private = private_w.max(dim=1).values
-        other_private_max = private_w[:, 1:].max(dim=1).values
 
-        shared_floor_penalty = F.relu(shared_target_weight - shared_w).mean()
-        shared_margin_penalty = F.relu(max_private + shared_margin - shared_w).mean()
-        private_floor_penalty = F.relu(private_min_weight - private_w).mean()
-        text_soft_rank_penalty = F.relu(other_private_max + 0.01 - text_w).mean()
+        shared_floor_penalty = zero
+        shared_margin_penalty = zero
+        private_floor_penalty = zero
+        text_soft_rank_penalty = zero
         dominance_margin = shared_w - max_private
     peak_penalty = F.relu(token_weights.max(dim=1).values - max_weight).mean()
 
     loss = (
         entropy_penalty
-        + 0.18 * balance
-        + 0.80 * shared_floor_penalty
-        + 0.65 * shared_margin_penalty
-        + 0.65 * private_floor_penalty
-        + 0.25 * text_soft_rank_penalty
+        + 0.10 * batch_balance
         + 0.75 * peak_penalty
     )
     stats = {
         "token_reg_loss": float(loss.item()),
         "token_entropy": float(entropy.mean().item()),
-        "token_balance": float(balance.item()),
+        "token_balance": float(batch_balance.item()),
         "token_max_weight": float(token_weights.max(dim=1).values.mean().item()),
         "token_floor_penalty": float(private_floor_penalty.item()),
         "token_peak_penalty": float(peak_penalty.item()),

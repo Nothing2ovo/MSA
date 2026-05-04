@@ -27,8 +27,9 @@ Current experimental variant:
    text-private / vision-private / audio-private.
 4. Cross-modal interaction is now concentrated in the downstream token-level
    Transformer fusion, while Mamba focuses on continuous intra-modal dynamics.
-5. The 6-token prior is rebalanced to reduce text-private dominance, and the
-   shared mixer regularizer now constrains refined shared-token alignment,
+5. The 6-token weighting no longer uses a fixed token prior; lightweight
+   regularization only discourages weight collapse and extreme peaks. The
+   shared mixer regularizer still constrains refined shared-token alignment,
    anti-collapse, modality-attention balance, and token-norm balance.
 6. Residual passthroughs are removed from the shared Mamba path, TMoE experts,
    token fusion block, and shared feature builder. These modules now return
@@ -39,6 +40,9 @@ Current experimental variant:
 8. The default training horizon is extended to 100 epochs with patience 15.
    Kaggle runs can override these through EPOCHS and PATIENCE environment
    variables to check whether deeper Mamba stacks need a longer convergence window.
+9. The 6-token fusion path now performs token interaction before dynamic
+   weighting. Fixed token priors, adaptive prior mixing, and hard shared/private
+   floors are removed so the final weights are learned from interacted tokens.
 
 Core model path:
-Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token fusion -> sentiment prediction.
+Factorized shared/private features -> shared branch: intra-modal official-Mamba mixer -> private branch: Transformer/TMoE experts -> 6-token interaction -> dynamic weighting -> sentiment prediction.

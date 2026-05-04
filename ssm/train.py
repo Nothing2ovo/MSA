@@ -178,7 +178,7 @@ def save_final_test_results(file_path: str, metrics: Dict[str, float]) -> None:
     analysis = metrics["analysis"]
     lines = [
         f"[{timestamp}]",
-        "========== Final Test (shared-residual decoupling + official-Mamba Shared Selective State Mixer + TMoEs + 4-token direct prediction) ==========",
+        "========== Final Test (shared-residual decoupling + official-Mamba Shared Selective State Mixer + TMoEs + 6-token interaction-first dynamic fusion) ==========",
         f"Test total loss: {metrics['total_loss']:.4f}",
         f"Test task loss : {metrics['task_loss']:.4f}",
         f"Test sim loss  : {metrics['sim_loss']:.4f}",
@@ -258,7 +258,7 @@ def print_epoch_summary(
         f"shared_align {valid_metrics['shared_align_loss']:.4f} | private_div {valid_metrics['private_div_loss']:.4f}"
     )
     print(
-        f"  6-token detail  = entropy {valid_metrics['token_entropy']:.4f} | prior-fit {valid_metrics['token_balance']:.4f} | "
+        f"  6-token detail  = entropy {valid_metrics['token_entropy']:.4f} | batch-var {valid_metrics['token_balance']:.4f} | "
         f"maxw {valid_metrics['token_max_weight']:.4f} | dom {valid_metrics['analysis']['token_dominance_margin']:.4f} | "
         f"floor {valid_metrics['analysis']['token_floor_penalty']:.4f} | peak {valid_metrics['analysis']['token_peak_penalty']:.4f}"
     )
@@ -330,7 +330,7 @@ def main() -> None:
     mamba_state_dim = 16
     shared_drop_rate = 0.15
 
-    print("[Config] shared-residual decoupling / intra-modal Shared Selective State Mixer(official Mamba) / TMoEs / 6-token direct prediction")
+    print("[Config] shared-residual decoupling / intra-modal Shared Selective State Mixer(official Mamba) / TMoEs / 6-token interaction-first dynamic fusion")
     print(
         f"[Config] sim={sim_weight:.3f} recon={recon_weight:.3f} moe={moe_weight:.3f} "
         f"supcon={supcon_weight:.3f} unsupcon={unsupcon_weight:.3f} "
